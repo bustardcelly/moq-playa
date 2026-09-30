@@ -35,7 +35,7 @@ import {
   RequestError18,
   SubscriptionState,
   ForwardState,
-} from '@moqt/transport';
+} from '@openmoq/transport';
 import type {
   EndpointRoleValue,
   ControlMessage,
@@ -73,8 +73,8 @@ import type {
   Parameters,
   TrackProperties,
   SubscriptionStateMachine,
-} from '@moqt/transport';
-import type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@moqt/transport';
+} from '@openmoq/transport';
+import type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@openmoq/transport';
 import { ControlStreamFramer } from './framer.js';
 import { createBidiControlTopology } from './topology/bidi-control.js';
 import { createUniPairTopology, PeerSetupRejectedError, RequestCancelledError, RequestGoawayError, type UniPairTopology, type RequestStream } from './topology/uni-pair.js';
