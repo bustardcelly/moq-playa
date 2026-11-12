@@ -9,7 +9,7 @@
  * @module
  */
 
-import type { Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
+import type { Level, AudioTrack, PlayerStats, PlayerState, Program, View } from './types.js';
 
 /** Event map for Player.on() / Player.off(). */
 export interface PlayerEventMap {
@@ -40,6 +40,16 @@ export interface PlayerEventMap {
   'levelsloaded': LevelsloadedEvent;
   /** Quality level switched (ABR or manual). */
   'qualitychange': QualitychangeEvent;
+  /** Audio output selection was adopted. */
+  'audiochange': AudiochangeEvent;
+  /** Audio selection rejected. An unrecoverable restore also reports a fatal playback error. */
+  'audiochangefailed': AudiochangefailedEvent;
+  /** Program selection was adopted; no optimistic change is reported. */
+  'programchange': { readonly program: Program | null };
+  'programchangefailed': { readonly programId: string; readonly message: string };
+  /** Video alternate-set selection was adopted. */
+  'viewchange': { readonly view: View | null };
+  'viewchangefailed': { readonly viewId: string; readonly message: string };
 
   /** Playback stalled (buffering). */
   'stall': StallEvent;
@@ -90,6 +100,15 @@ export interface LevelsloadedEvent {
 export interface QualitychangeEvent {
   readonly level: Level;
   readonly auto: boolean;
+}
+
+export interface AudiochangeEvent {
+  readonly track: AudioTrack;
+}
+
+export interface AudiochangefailedEvent {
+  readonly trackId: string;
+  readonly message: string;
 }
 
 export interface StallEvent {

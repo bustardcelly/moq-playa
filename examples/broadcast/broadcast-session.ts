@@ -79,11 +79,17 @@ export class BroadcastSession {
     this.timeline = new TimelinePublisher(connection, {
       wrapInt: opts.publisher.wrapInt,
       draft: opts.publisher.draft,
-      onError: opts.publisher.onError,
+      onError: opts.publisher.onError ?? (() => {}),
     });
     this.publisher = new MediaPublisher(connection, {
       ...opts.publisher,
       onVideoGroup: (group) => this.timeline.noteGroup(group),
+    // The catalog's codecs ride as the LOC-05 Codec String unless the caller set them.
+      codecStrings: {
+        video: opts.catalog.videoCodec,
+        ...(opts.catalog.audio ? { audio: 'opus' } : {}),
+        ...opts.publisher.codecStrings,
+      },
     });
   }
 

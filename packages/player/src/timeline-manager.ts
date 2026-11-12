@@ -53,7 +53,11 @@ export function createTimelineState(track: CatalogTrack): TimelineState {
  * @see draft-ietf-moq-msf-00 §7.3 (timeline updating)
  */
 export function processTimelineObject(state: TimelineState, payload: Uint8Array): TimelineState {
-  const newEntries = parseMediaTimeline(payload);
+  return mergeTimelineEntries(state, parseMediaTimeline(payload));
+}
+
+/** Merge already parsed records after their declaring owner has checked them. */
+export function mergeTimelineEntries(state: TimelineState, newEntries: MediaTimelineEntry[]): TimelineState {
   return {
     ...state,
     entries: mergeMediaTimeline(state.entries, newEntries),
@@ -90,4 +94,15 @@ export function getTimelineDuration(state: TimelineState): number | undefined {
   if (state.entries.length === 0) return undefined;
   const last = state.entries[state.entries.length - 1];
   return last?.mediaPts;
+}
+
+/** Exact explicit Location only; no PTS mapping or fallback across unknown entries. */
+export function findEncodeAnchor(state: TimelineState, groupId: bigint, objectId: bigint): MediaTimelineEntry | undefined {
+  if (groupId < 0n || objectId < 0n) return undefined;
+  const matches = state.entries.filter(entry => entry.location.every(value => Number.isSafeInteger(value) && value >= 0)
+    && BigInt(entry.location[0]) === groupId && BigInt(entry.location[1]) === objectId);
+  if (matches.length !== 1) return undefined;
+  const entry = matches[0]!;
+  return Number.isFinite(entry.mediaPts) && Number.isFinite(entry.wallclockTime) && entry.wallclockTime > 0
+    ? entry : undefined;
 }

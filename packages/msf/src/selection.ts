@@ -9,6 +9,7 @@
  * @module
  */
 
+import { identityKey, namespaceFieldsOf, trackIdentityKey } from './track-identity.js';
 import type { CatalogTrack, CatalogState, RenderGroup, AltGroup, TrackConstraints } from './types.js';
 import { SUPPORTED_LOCMAF_VERSIONS } from './types.js';
 
@@ -94,6 +95,25 @@ export function groupByAlt(
     }
 
     return { groups, ungrouped };
+}
+
+/**
+ * Select one video switching set. Callers filter unsupported tracks first.
+ * Omission preserves first-group selection and the legacy ungrouped ladder.
+ * An explicit group never falls back to another view.
+ * @see draft-ietf-moq-msf-01 §5.2.12
+ */
+export function selectVideoAltGroup(
+    tracks: readonly CatalogTrack[],
+    altGroup?: number,
+): CatalogTrack[] {
+    const { groups } = groupByAlt(tracks);
+    if (altGroup !== undefined) {
+        const group = groups.find(g => g.altGroup === altGroup);
+        if (!group) throw new Error(`Unknown video altGroup: ${altGroup}`);
+        return [...group.tracks];
+    }
+    return groups.length > 0 ? [...groups[0]!.tracks] : [...tracks];
 }
 
 /**
@@ -195,8 +215,10 @@ export function resolveDependencies(
 
         if (t.depends) {
             for (const depName of t.depends) {
-                // §5.1.21: namespace of dependencies matches declaring track's namespace
-                const depKey = `${t.namespace ?? ''}\0${depName}`;
+                // msf-01 §5.2.14 / cf01 §3.2.18: a dependency name resolves in
+                // the DECLARING track's namespace, so the key is built from
+                // that track's resolved fields rather than from the name alone.
+                const depKey = identityKey(namespaceFieldsOf(t), depName);
                 const dep = byKey.get(depKey);
                 if (!dep) {
                     throw new Error(
@@ -216,7 +238,7 @@ export function resolveDependencies(
     return result;
 }
 
-/** Composite key for track identity: namespace + '\0' + name. */
+/** Composite key for track identity: resolved namespace fields plus name. */
 function trackKey(t: CatalogTrack): string {
-    return `${t.namespace ?? ''}\0${t.name}`;
+    return trackIdentityKey(t);
 }

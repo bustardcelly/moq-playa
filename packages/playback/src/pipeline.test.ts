@@ -11,8 +11,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { PlaybackPipeline } from './pipeline.js';
 import { SyncController } from './sync.js';
+import { AdaptiveToleranceController } from './adaptive-tolerance.js';
 import { DefaultRecoveryController } from './recovery.js';
-import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback } from './types.js';
+import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig } from './types.js';
 import type { MoqtObjectData, MoqtObjectGap } from '@openmoq/transport';
 import { varint, ObjectStatus } from '@openmoq/transport';
 import type { LocHeaders } from '@openmoq/loc';
@@ -114,7 +115,7 @@ function createPipeline(opts: {
         sync,
         onCommand: (cmd) => commands.push(cmd),
         onEvent: (evt) => events.push(evt),
-        recovery: opts.recovery,
+        ...(opts.recovery !== undefined ? { recovery: opts.recovery } : {}),
     });
 
     return { pipeline, commands, events, sync };
@@ -123,6 +124,24 @@ function createPipeline(opts: {
 // ─── Tests ────────────────────────────────────────────────────────────
 
 describe('PlaybackPipeline', () => {
+    it.each(['video', 'audio'] as const)('preserves exact %s source time on the emitted decode command', (mediaType) => {
+        const clock = new MockClock();
+        const { pipeline, commands } = createPipeline({ mediaType, clock });
+        if (mediaType === 'audio') pipeline.configure(new Uint8Array([1]));
+        pipeline.pushObject(makeData(0, 0), {
+            ...videoHeaders(1_000_011n, true, new Uint8Array([1, 100])),
+            timestamp: 90_001n,
+            timescale: 90_000n,
+            timestampIsWallClock: false,
+        });
+        pipeline.tick();
+        const decode = commands.find(c => c.type === 'decode_video' || c.type === 'decode_audio');
+        expect(decode).toBeDefined();
+        if (decode?.type !== 'decode_video' && decode?.type !== 'decode_audio') throw new Error('decode missing');
+        expect(decode.chunk.sourceTimestamp).toEqual({ ticks: 90_001n, ticksPerSecond: 90_000n, domain: 'media' });
+        expect(decode.chunk.timestamp).toBe(1_000_011);
+    });
+
     it('sequential group, 3 video objects → configure + 3 decode commands (§4.2)', () => {
         const clock = new MockClock();
         clock.set(5_000_000);
@@ -272,7 +291,7 @@ describe('PlaybackPipeline', () => {
     it('keyframe recovery after gap → decode resumes (§2.3.2.2)', () => {
         const clock = new MockClock();
         clock.set(5_000_000);
-        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
         sync.setAudioReference(1_000_000_000n);
 
         // Consume group 0
@@ -329,10 +348,52 @@ describe('PlaybackPipeline', () => {
         expect(flushCmd).toBeDefined();
     });
 
+    it('consumes buffered video before the EOT flush', () => {
+        const clock = new MockClock(); clock.set(5_000_000);
+        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(1_000_000_000n);
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([1])));
+        pipeline.pushObject(makeGap(0, 1, ObjectStatus.END_OF_TRACK));
+        commands.length = 0;
+        pipeline.tick();
+        expect(commands.some(command => command.type === 'decode_video')).toBe(true);
+        pipeline.tick();
+        expect(events.filter(event => event.type === 'track_ended')).toHaveLength(1);
+        expect(commands.findIndex(command => command.type === 'flush')).toBeGreaterThan(
+            commands.findIndex(command => command.type === 'decode_video'));
+    });
+
+    it('resolves a missing group while draining buffered video toward EOT', () => {
+        const clock = new MockClock(); clock.set(5_000_000);
+        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(1_000_000_000n);
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([1])));
+        pipeline.tick();
+        pipeline.pushObject(makeData(2, 0), videoHeaders(1_000_100_000n, true));
+        pipeline.pushObject(makeGap(3, 0, ObjectStatus.END_OF_TRACK));
+        for (let i = 0; i < 10; i++) { clock.advance(1_000_000); pipeline.tick(); }
+        expect(commands.filter(command => command.type === 'decode_video')).toHaveLength(2);
+        expect(events.filter(event => event.type === 'track_ended')).toHaveLength(1);
+    });
+
+    it.each(['reset', 'switch'] as const)('a retired terminal hold cannot release the successor hold after %s', reset => {
+        const clock = new MockClock(); clock.set(5_000_000);
+        const { pipeline, events, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(1_000_000_000n);
+        const old = pipeline.holdTrackEnd();
+        if (reset === 'reset') pipeline.reset(); else pipeline.resetForTrackSwitch(0n);
+        const current = pipeline.holdTrackEnd(); old(); old();
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([1])));
+        pipeline.pushObject(makeGap(1, 0, ObjectStatus.END_OF_TRACK));
+        pipeline.tick(); pipeline.tick(); expect(events.filter(event => event.type === 'track_ended')).toEqual([]);
+        current(); current(); pipeline.tick();
+        expect(events.filter(event => event.type === 'track_ended')).toHaveLength(1);
+    });
+
     it('track_ended emits only once across multiple ticks', () => {
         const clock = new MockClock();
         clock.set(5_000_000);
-        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        const { pipeline, events, sync } = createPipeline({ mediaType: 'video', clock });
         sync.setAudioReference(1_000_000_000n);
 
         // Consume group 0
@@ -1341,6 +1402,7 @@ describe('PlaybackPipeline', () => {
             pipeline.handleFeedback({
                 type: 'frame_rendered',
                 captureTimestampUs: 1_000_400_000n,
+                mediaType: 'video',
                 scheduledRenderUs: 5_400_000,
                 actualRenderUs: 5_700_000,
             });
@@ -1386,6 +1448,7 @@ describe('PlaybackPipeline', () => {
             pipeline.handleFeedback({
                 type: 'frame_rendered',
                 captureTimestampUs: 1_000_400_000n,
+                mediaType: 'video',
                 scheduledRenderUs: 5_400_000,
                 actualRenderUs: 5_700_000,
             });
@@ -1744,31 +1807,25 @@ describe('PlaybackPipeline', () => {
             expect([...ts].sort((a, b) => Number(a - b))).toEqual(ts);
         });
 
-        it('DOCUMENTED LIMITATION: a tick between live tail and fetched head discards one tail object per tick', () => {
-            // The reset-sync path (initial join / pause-resume) extracts and
-            // drops the buffer top when it is not a keyframe, one object per
-            // tick, until a keyframe-starting group appears. Under warm start
-            // this means live-tail objects racing ahead of the FETCH head can
-            // be discarded, leaving a gap the existing gap-timeout recovery
-            // must skip. This test pins that exact behavior so any future
-            // keyframe-wait relaxation shows up as a deliberate change.
-            const clock = new MockClock();
-            clock.set(5_000_000);
+        it('retains live tail across ticks until the fetched head establishes decode order', () => {
+            const clock = new MockClock(); clock.set(5_000_000);
             const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
             sync.setAudioReference(1_000_000_000n);
-
-            pipeline.pushObject(makeData(0, 2), videoHeaders(1_000_066_000n, false));
-            pipeline.pushObject(makeData(0, 3), videoHeaders(1_000_100_000n, false));
-            pipeline.tick(); // discards object 2 (top, not a keyframe)
-
+            const tail2 = {}, tail3 = {}, discarded = vi.fn(); pipeline.inputObserver = discarded;
+            pipeline.pushObject(makeData(0, 2), videoHeaders(1_000_066_000n, false), tail2);
+            pipeline.pushObject(makeData(0, 3), videoHeaders(1_000_100_000n, false), tail3);
+            pipeline.tick();
+            expect(pipeline.bufferedGroupCount).toBe(1);
+            expect(commands).toEqual([]); expect(discarded).not.toHaveBeenCalled();
             pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([0x01, 0x64])));
             pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_000n, false));
             pipeline.tick();
-
-            // Head decodes; object 3 is stranded behind the discarded 2 (gap
-            // recovery, not this test's scope, would eventually skip forward).
-            const decoded = commands.filter((c) => c.type === 'decode_video');
-            expect(decoded.length).toBe(2);
+            const decoded = commands.filter(c => c.type === 'decode_video');
+            expect(decoded).toHaveLength(4);
+            expect(decoded.map(c => c.chunk.timestamp)).toEqual([1_000_000_000, 1_000_033_000, 1_000_066_000, 1_000_100_000]);
+            expect(decoded[2]?.inputToken).toBe(tail2); expect(decoded[3]?.inputToken).toBe(tail3);
+            expect(commands.filter(c => c.type === 'reset')).toEqual([]);
+            expect(discarded).not.toHaveBeenCalled(); expect(pipeline.bufferedGroupCount).toBe(0);
         });
     });
 
@@ -1984,7 +2041,7 @@ describe('PlaybackPipeline', () => {
         it('audio is NOT affected by video group lifecycle (independently decodable)', () => {
             const clock = new MockClock();
             clock.set(5_000_000);
-            const { pipeline, commands, sync } = createPipeline({ mediaType: 'audio', clock });
+            const { pipeline, commands } = createPipeline({ mediaType: 'audio', clock });
 
             pipeline.configure(new Uint8Array([0x01]));
 
@@ -2024,6 +2081,27 @@ describe('PlaybackPipeline', () => {
             expect(run(false)).toBeCloseTo(run(true), 0);
         });
 
+        it('keeps video capture age when shared-sync audio uses media timestamps', () => {
+            const clock = new MockClock();
+            const now = 1_800_000_000_000_000;
+            const sync = new SyncController({ driftThresholdUs: 500_000, clock, wallClock: { now: () => now } });
+            const video = createPipeline({ mediaType: 'video', clock, sync });
+            const audio = createPipeline({ mediaType: 'audio', clock, sync });
+            video.pipeline.configure(new Uint8Array([1]));
+            audio.pipeline.configure(new Uint8Array([1]));
+            video.pipeline.pushObject(makeData(1, 0), {
+                ...videoHeaders(BigInt(now - 250_000), true), timestampIsWallClock: true,
+            });
+            video.pipeline.tick();
+            expect(sync.captureTimestampAgeUs).toBe(250_000);
+            expect(video.commands.some(command => command.type === 'decode_video')).toBe(true);
+            audio.pipeline.pushObject(makeData(1, 0), {
+                captureTimestamp: 500_000n, timestampIsWallClock: false,
+            });
+            audio.pipeline.tick();
+            expect(sync.captureTimestampAgeUs).toBe(250_000);
+        });
+
         it('does not measure wall-clock latency when timestampIsWallClock is false', () => {
             const clock = new MockClock();
             clock.set(5_000_000);
@@ -2034,7 +2112,7 @@ describe('PlaybackPipeline', () => {
             pipeline.pushObject(makeData(1, 0), { captureTimestamp: 1_000_000n, timestampIsWallClock: false });
             pipeline.tick();
 
-            expect(spy).toHaveBeenCalledWith(1_000_000n, false);
+            expect(spy).toHaveBeenCalledWith(1_000_000n, false, 'audio');
             expect(sync.latencyUs).toBe(0);
         });
 
@@ -2093,4 +2171,103 @@ describe('PlaybackPipeline — LOC-04 Audio Config', () => {
         pipeline.tick();
         expect(commands.filter(c => c.type === 'configure')).toHaveLength(0);
     });
+});
+
+
+it('excludes actual backfill arrivals from jitter without suppressing live arrivals', () => {
+    const arrived = vi.spyOn(AdaptiveToleranceController.prototype, 'onFrameArrived');
+    const clock = new MockClock();
+    const { pipeline } = createPipeline({ mediaType: 'video', clock,
+        config: { ...DEFAULT_CONFIG, adaptiveTolerance: true } });
+    try {
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000n, true), undefined, { backfill: true });
+        expect.soft(arrived).not.toHaveBeenCalled();
+        pipeline.pushObject(makeData(0, 1), videoHeaders(1_033_333n, false));
+        expect(arrived).toHaveBeenCalledTimes(1);
+    } finally { arrived.mockRestore(); }
+});
+
+function joinedBackfill(backfill: boolean, audioFirst = true) {
+    const clock = new MockClock(); clock.set(5_000_000);
+    const sync = new SyncController({ clock, wallClock: { now: () => 1_000_250_000 },
+        driftThresholdUs: 150_000, targetLatencyMs: 250, catchUpThresholdMs: 100, maxCatchUpRate: 1.1 });
+    const audio = createPipeline({ mediaType: 'audio', clock, sync });
+    const video = createPipeline({ mediaType: 'video', clock, sync });
+    audio.pipeline.configure(new Uint8Array([1]));
+    const anchorAudio = () => { audio.pipeline.pushObject(makeData(0, 0), audioHeaders(1_000_000_000n)); audio.pipeline.tick(); };
+    if (audioFirst) anchorAudio();
+    video.pipeline.pushObject(makeData(0, 0), videoHeaders(999_500_000n, true, new Uint8Array([1])), undefined, { backfill });
+    video.pipeline.tick();
+    const ageAfterHead = sync.latencyUs;
+    const headRates = video.commands.filter(command => command.type === 'set_playback_rate');
+    if (!audioFirst) anchorAudio();
+    clock.advance(50_000);
+    audio.pipeline.pushObject(makeData(0, 1), audioHeaders(1_000_033_333n)); audio.pipeline.tick();
+    video.pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_333n, false)); video.pipeline.tick();
+    const a = audio.commands.filter(command => command.type === 'decode_audio').at(-1);
+    const v = video.commands.filter(command => command.type === 'decode_video').at(-1);
+    if (!a || !v) throw new Error('fixture did not emit both decode commands');
+    return { difference: v.renderTimeUs - a.renderTimeUs, ageAfterHead, headRates };
+}
+
+describe('backfill timing on the shared playback clock', () => {
+    it('keeps later live video aligned with same-PTS audio after audio-first backfill', () => {
+        expect(joinedBackfill(true).difference).toBe(0);
+    });
+    it('keeps video-first backfill aligned when audio establishes the reference later', () => {
+        expect(joinedBackfill(true, false).difference).toBe(0);
+    });
+    it('preserves the ordinary live-join re-anchor', () => {
+        expect(joinedBackfill(false).difference).toBe(516_000);
+    });
+    it('does not change live capture age or catch-up rate in response to older backfill', () => {
+        const head = joinedBackfill(true);
+        expect.soft(head.ageAfterHead).toBe(250_000);
+        expect(head.headRates).toEqual([]);
+        const ordinary = joinedBackfill(false);
+        expect(ordinary.ageAfterHead).toBe(750_000);
+        expect(ordinary.headRates).toHaveLength(1);
+    });
+    it.each(['reset', 'eviction'] as const)('forgets the backfill bit with buffered ownership on %s', action => {
+        const clock = new MockClock(); clock.set(5_000_000);
+        const sync = new SyncController({ clock, driftThresholdUs: 150_000 });
+        sync.setAudioReference(1_000_000_000n);
+        const { pipeline, commands } = createPipeline({ mediaType: 'video', clock, sync,
+            config: { ...DEFAULT_CONFIG, maxBufferDepth: 1 } });
+        pipeline.pushObject(makeData(0, 0, undefined, 0, 200), videoHeaders(999_500_000n, true), undefined, { backfill: true });
+        if (action === 'reset') pipeline.reset();
+        else {
+            pipeline.pushObject(makeData(0, 1, undefined, 0, 1), videoHeaders(999_533_333n, false));
+            // Keep the replacement queued until a higher-priority ordinary
+            // Object0 can re-admit before abandonment seals this Group.
+        }
+        pipeline.pushObject(makeData(0, 0, undefined, 0, 0), videoHeaders(999_500_000n, true, new Uint8Array([1])));
+        pipeline.tick();
+        expect(commands.filter(command => command.type === 'decode_video')).toHaveLength(1);
+        expect(sync.videoJoinOffsetUs).toBe(516_000);
+    });
+});
+
+it.each([false, true])('a refused input cannot mark its reentrant replacement as backfill: %s', backfill => {
+    const clock = new MockClock(); clock.set(5_000_000);
+    const sync = new SyncController({ clock, driftThresholdUs: 150_000 });
+    sync.setAudioReference(1_000_000_000n);
+    const commands: DecoderCommand[] = [];
+    let recoveries = 0;
+    const pipeline = new PlaybackPipeline({
+        mediaType: 'video', clock, sync, config: { ...DEFAULT_CONFIG, maxBufferDepth: 1 },
+        recovery: new DefaultRecoveryController(), onCommand: command => commands.push(command),
+        onEvent: event => {
+            if (event.type !== 'recovery') return;
+            recoveries++;
+            pipeline.reset();
+            pipeline.pushObject(makeData(0, 0), videoHeaders(999_500_000n, true, new Uint8Array([1])));
+        },
+    });
+    pipeline.pushObject(makeData(1, 0), videoHeaders(1_000_000_000n, true));
+    pipeline.pushObject(makeData(0, 0), videoHeaders(999_500_000n, true), undefined, { backfill });
+    pipeline.tick();
+    expect(recoveries).toBe(1);
+    expect(commands.filter(command => command.type === 'decode_video')).toHaveLength(1);
+    expect(sync.videoJoinOffsetUs).toBe(516_000);
 });

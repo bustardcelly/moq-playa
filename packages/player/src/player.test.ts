@@ -20,21 +20,27 @@ import { PlayerErrorCode } from './errors.js';
 import type { PlayerError } from './errors.js';
 import { QualityController } from './quality-controller.js';
 import { PlayerState } from './state.js';
+import type { CatalogState } from '@openmoq/msf';
+import type { MediaSourceLike } from './interfaces.js';
 import type { MoqtPlayerConfig } from './config.js';
-import type { PlayerEventMap } from './events.js';
 import { MoqtConnectionError } from '@openmoq/webtransport';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@openmoq/transport';
 import { varint, ObjectStatus } from '@openmoq/transport';
 import { encodeLocHeaders } from '@openmoq/loc';
 import type { ClockSource } from '@openmoq/playback';
-import type { DataStreamTerminal } from '@openmoq/webtransport';
+import type { DataStreamTerminal, GoawayNotice } from '@openmoq/webtransport';
+import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
 /** Minimal mock of MoqtConnection for testing. */
 function createMockAdapter(): MoqtConnection & {
+  draftVersion: MoqtConnection['draftVersion'];
+  unsubscribe: ReturnType<typeof vi.fn<MoqtConnection['unsubscribe']>>;
+  subscribe: ReturnType<typeof vi.fn<MoqtConnection['subscribe']>>;
   _triggerMessage: (msg: ControlMessage) => void;
+  _triggerGoawayNotice: (notice: GoawayNotice) => void;
   _triggerObject: (streamId: bigint, obj: MoqtObject) => void;
   _triggerDatagram: (datagram: ObjectDatagram) => void;
   _triggerDataStream: (streamId: bigint, header: DataStreamHeader) => void;
@@ -83,13 +89,25 @@ function createMockAdapter(): MoqtConnection & {
     unsubscribe: vi.fn(async () => {}),
     fetch: vi.fn(async () => varint(nextRequestId++)),
     fetchCancel: vi.fn(async () => {}),
-    trackStatus: vi.fn(async () => varint(nextRequestId++)),
+    // Mirrors the real contract: the pre-send ownership hook fires between
+    // request-ID allocation and wire emission, so a caller can register before
+    // any response (or a request-stream GOAWAY) can be handled.
+    trackStatus: vi.fn(async (_ns: unknown, _n: unknown, opts?: { onRequestId?: (id: bigint) => void }) => {
+      const requestId = varint(nextRequestId++);
+      opts?.onRequestId?.(BigInt(requestId));
+      return requestId;
+    }),
     subscribeNamespace: vi.fn(async () => varint(nextRequestId++)),
     cancelNamespace: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
 
     _triggerMessage(msg: ControlMessage) {
       adapter.onMessage?.(msg);
+    },
+    // Delivers an ACCEPTED, scoped notice — the player's GOAWAY entry point.
+    // Stated by the test, never synthesized from a raw message.
+    _triggerGoawayNotice(notice: GoawayNotice) {
+      adapter.onGoawayNotice?.(notice, adapter as unknown as MoqtConnection);
     },
     _triggerObject(streamId: bigint, obj: MoqtObject) {
       adapter.onObject?.(streamId, obj);
@@ -179,6 +197,58 @@ async function resolveConnect(adapter: ReturnType<typeof createMockAdapter>): Pr
 }
 
 /**
+ * Make a migration candidate ADOPTABLE, the way a real relay does.
+ *
+ * Readiness is evidence, not intent: the replacement's catalog subscribe is
+ * answered, its catalog delivered, and each required media subscribe accepted.
+ * Before graceful handover existed these fixtures only had to let `connect()`
+ * resolve, because the old session was retired as soon as the catalog
+ * SUBSCRIBE had been SENT. That is no longer a handover — the player now
+ * waits for the replacement to be usable (§7.4.1) — so the mock peer has to
+ * answer. The alternative would be a shortcut in production that accepts a
+ * replacement nobody answered, which is the behavior these fixtures were
+ * written to pin down in the first place.
+ *
+ * Request ids double as track aliases here, so a fresh adapter reuses the old
+ * session's aliases exactly as a real second relay may.
+ */
+async function acceptReplacement(
+  adapter: ReturnType<typeof createMockAdapter>,
+  catalogJson: string = CATALOG_JSON,
+): Promise<void> {
+  const decode = new TextDecoder();
+  const subscribeIdFor = async (trackName: string): Promise<bigint> => {
+    let index = -1;
+    await vi.waitFor(() => {
+      index = (adapter.subscribe as any).mock.calls.findIndex(
+        (call: unknown[]) => decode.decode(call[1] as Uint8Array) === trackName);
+      expect(index, `replacement subscribed ${trackName}`).toBeGreaterThanOrEqual(0);
+    });
+    return BigInt(await (adapter.subscribe as any).mock.results[index]!.value);
+  };
+  const accept = (id: bigint): void => {
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(id), parameters: new Map(),
+    } as unknown as ControlMessage);
+  };
+  const catalogId = await subscribeIdFor('catalog');
+  accept(catalogId);
+  adapter._triggerObject(0n, { publisherPriority: 128,
+    kind: 'data',
+    trackAlias: varint(catalogId),
+    groupId: varint(0),
+    subgroupId: varint(0),
+    objectId: varint(0),
+    payload: new TextEncoder().encode(catalogJson),
+  } as MoqtObject);
+  const tracks = (JSON.parse(catalogJson) as { tracks: Array<{ name: string; role?: string }> }).tracks;
+  for (const track of tracks) {
+    if (track.role !== 'video' && track.role !== 'audio') continue;
+    accept(await subscribeIdFor(track.name));
+  }
+}
+
+/**
  * Send SUBSCRIBE_OK for the catalog subscription.
  *
  * §10.4.2: data may arrive before SUBSCRIBE_OK. The player buffers unknown
@@ -221,6 +291,23 @@ describe('catalog subscribe retry intervals and ownership', () => {
     await resolveConnect(adapter);
     await loading;
     return { adapter, player };
+  }
+
+  /**
+   * Accept the two media tracks a replacement asks for after its catalog.
+   *
+   * Fake timers here, so registration is flushed with `advanceTimersByTimeAsync(0)`
+   * rather than `vi.waitFor`. A fresh mock adapter numbers its requests from 1,
+   * so the catalog is 1 and the media that follows is 2 and 3.
+   */
+  async function acceptReplacementMedia(adapter: ReturnType<typeof createMockAdapter>) {
+    for (const id of [2n, 3n]) {
+      await vi.advanceTimersByTimeAsync(0);
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(id), parameters: new Map(),
+      } as ControlMessage);
+    }
+    await vi.advanceTimersByTimeAsync(0);
   }
 
   function rejectCatalog(adapter: ReturnType<typeof createMockAdapter>, retryInterval = 1n) {
@@ -307,14 +394,22 @@ describe('catalog subscribe retry intervals and ownership', () => {
 
   it('does not let a superseded timer suppress the replacement session retry', async () => {
     const { adapter, player } = await loaded();
-    rejectCatalog(adapter);
+    rejectCatalog(adapter); // the old session arms a retry of its own
     const replacement = createMockAdapter();
-    const migrating = player.migrate(replacement);
+    // The replacement's retry now happens INSIDE the handover: a graceful
+    // handover waits for the replacement to be usable, so its own retriable
+    // refusal is retried under the attempt rather than after adoption.
+    const migrating = player.migrate(replacement).catch(() => undefined);
     await resolveConnect(replacement);
-    await migrating;
+    await vi.advanceTimersByTimeAsync(0);
     rejectCatalog(replacement);
     await vi.advanceTimersByTimeAsync(2000);
     expect(replacement.subscribe).toHaveBeenCalledTimes(2);
+    // The attempt is bounded by its own deadline, not by the retry: once it
+    // expires the OLD session is still the current one.
+    await vi.advanceTimersByTimeAsync(11_000);
+    await migrating;
+    expect((player as unknown as { connection: unknown }).connection).toBe(adapter);
   });
 
   it('does not let a completed old retry overwrite the replacement catalog request', async () => {
@@ -330,18 +425,22 @@ describe('catalog subscribe retry intervals and ownership', () => {
     const replacement = createMockAdapter();
     const migrating = player.migrate(replacement);
     await resolveConnect(replacement);
-    await migrating;
+    await vi.advanceTimersByTimeAsync(0);
+    // The OLD session's retry completes LATE, with its own request id, while
+    // the replacement's catalog request is still the pending one.
     finishRetry(varint(2));
     await vi.advanceTimersByTimeAsync(0);
 
     const received = vi.fn();
     player.on('catalog_received', received);
     ackCatalog(replacement);
-    replacement._triggerObject(0n, {
+    replacement._triggerObject(0n, { publisherPriority: 128,
       kind: 'data', trackAlias: varint(1), groupId: varint(0),
       subgroupId: varint(0), objectId: varint(0),
       payload: new TextEncoder().encode(CATALOG_JSON),
     } as MoqtObject);
+    await acceptReplacementMedia(replacement);
+    await migrating;
     expect(received).toHaveBeenCalledTimes(1);
   });
 
@@ -357,13 +456,15 @@ describe('catalog subscribe retry intervals and ownership', () => {
     const replacement = createMockAdapter();
     const migrating = player.migrate(replacement);
     await resolveConnect(replacement);
-    await migrating;
+    await vi.advanceTimersByTimeAsync(0);
     failRetry(new Error('Old stream closed'));
     await vi.advanceTimersByTimeAsync(0);
 
     const received = vi.fn();
     player.on('catalog_received', received);
-    replacement._triggerObject(0n, {
+    // The replacement's catalog arrives BEFORE its SUBSCRIBE_OK, so it is held
+    // under the pending request the failed old retry must not have reclaimed.
+    replacement._triggerObject(0n, { publisherPriority: 128,
       kind: 'data', trackAlias: varint(40), groupId: varint(0),
       subgroupId: varint(0), objectId: varint(0),
       payload: new TextEncoder().encode(CATALOG_JSON),
@@ -371,6 +472,10 @@ describe('catalog subscribe retry intervals and ownership', () => {
     replacement._triggerMessage({
       type: 'SUBSCRIBE_OK', requestId: varint(1), trackAlias: varint(40), parameters: new Map(),
     } as ControlMessage);
+    await acceptReplacementMedia(replacement);
+    await migrating;
+    // The player had no catalog before this handover, so the adopted one is
+    // its FIRST — announced exactly once.
     expect(received).toHaveBeenCalledTimes(1);
   });
 });
@@ -416,7 +521,7 @@ describe('request ID and track alias namespace separation', () => {
     } as unknown as ControlMessage);
     // Routing is observed before CMAF parsing. Payload markers identify the
     // source track independently of the player's chosen media type.
-    const send = (alias: bigint, marker: number) => adapter._triggerObject(BigInt(marker), {
+    const send = (alias: bigint, marker: number) => adapter._triggerObject(BigInt(marker), { publisherPriority: 128,
       kind: 'data', trackAlias: varint(alias), groupId: varint(0), subgroupId: varint(0),
       objectId: varint(0), payload: Uint8Array.of(0, 0, 0, 9, 109, 100, 97, 116, marker),
     } as MoqtObject);
@@ -425,7 +530,7 @@ describe('request ID and track alias namespace separation', () => {
       await resolveConnect(adapter);
       await load;
       ackCatalog(adapter, 0n);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data', trackAlias: varint(0), groupId: varint(0), subgroupId: varint(0),
         objectId: varint(0), payload: new TextEncoder().encode(JSON.stringify({
           version: 1,
@@ -504,7 +609,7 @@ describe('MoqtPlayer', () => {
 
   it('load() calls createTransport with constructed URL (url + namespace)', async () => {
     const adapter = createMockAdapter();
-    const createTransport = vi.fn(async () => ({} as any));
+    const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({} as any));
     const player = new MoqtPlayer({
       ...createConfig(adapter),
       createTransport,
@@ -514,14 +619,14 @@ describe('MoqtPlayer', () => {
     await loadPromise;
 
     expect(createTransport).toHaveBeenCalledTimes(1);
-    const url = createTransport.mock.calls[0][0];
+    const url = createTransport.mock.calls[0]![0];
     expect(url).toBe('https://relay.example.com/moq');
   });
 
   it('load() passes transport from createTransport to adapter.connect', async () => {
     const adapter = createMockAdapter();
     const mockTransport = { mock: 'transport' };
-    const createTransport = vi.fn(async () => mockTransport as any);
+    const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => mockTransport as any);
     const player = new MoqtPlayer({
       ...createConfig(adapter),
       createTransport,
@@ -538,7 +643,7 @@ describe('MoqtPlayer', () => {
 
   it('load() rejects if createTransport rejects', async () => {
     const adapter = createMockAdapter();
-    const createTransport = vi.fn(async () => {
+    const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => {
       throw new Error('transport creation failed');
     });
     const player = new MoqtPlayer({
@@ -551,7 +656,7 @@ describe('MoqtPlayer', () => {
 
   it('connect URL encodes namespace with special characters correctly', async () => {
     const adapter = createMockAdapter();
-    const createTransport = vi.fn(async () => ({} as any));
+    const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({} as any));
     const player = new MoqtPlayer({
       ...createConfig(adapter),
       namespace: 'Night of the Living Dead (1968) English',
@@ -561,7 +666,7 @@ describe('MoqtPlayer', () => {
     await resolveConnect(adapter);
     await loadPromise;
 
-    const url = createTransport.mock.calls[0][0];
+    const url = createTransport.mock.calls[0]![0];
     expect(url).toBe('https://relay.example.com/moq');
   });
 
@@ -572,6 +677,7 @@ describe('MoqtPlayer', () => {
     expect(player.state).toBe(PlayerState.LOADING);
     // Clean up — resolve the connect promise
     await resolveConnect(adapter);
+    await loadPromise;
   });
 
   it('emits session_connecting on load()', async () => {
@@ -684,8 +790,9 @@ describe('MoqtPlayer', () => {
   it('destroy() cleans up and transitions to ended', async () => {
     const adapter = createMockAdapter();
     const player = new MoqtPlayer(createConfig(adapter));
-    player.load();
+    const loading = player.load();
     await resolveConnect(adapter);
+    await loading;
 
     await player.destroy();
     expect(adapter.close).toHaveBeenCalled();
@@ -762,8 +869,9 @@ describe('MoqtPlayer', () => {
     const player = new MoqtPlayer(createConfig(adapter));
     const errorEvents: unknown[] = [];
     player.on('error', (e) => errorEvents.push(e));
-    player.load();
+    const loading = player.load();
     await resolveConnect(adapter);
+    await loading;
 
     // Quiet-destroy contract: a dead transport rejecting close() must not
     // make destroy() reject for library consumers without a try/catch.
@@ -810,10 +918,7 @@ describe('MoqtPlayer', () => {
     player.load();
     await resolveConnect(adapter);
 
-    adapter._triggerMessage({
-      type: 'GOAWAY',
-      newSessionUri: 'https://new-relay.example.com/moq',
-    } as ControlMessage);
+    adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
     expect(fn).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -856,6 +961,20 @@ describe('MoqtPlayer', () => {
 
     player.play();
     expect(player.state).toBe(PlayerState.PLAYING);
+  });
+
+  it('play() while playing is a no-op', async () => {
+    const adapter = createMockAdapter();
+    const player = new MoqtPlayer(createConfig(adapter));
+    player.load();
+    await resolveConnect(adapter);
+    player.play();
+    const changes: unknown[] = [];
+    player.on('state_changed', (e) => changes.push(e));
+
+    expect(() => player.play()).not.toThrow();
+    expect(player.state).toBe(PlayerState.PLAYING);
+    expect(changes).toEqual([]);
   });
 
   // ─── Catalog subscription (§9.9, MSF §9.1) ─────────────────
@@ -935,7 +1054,7 @@ describe('MoqtPlayer', () => {
 
         // Publisher has since shown up: this attempt succeeds.
         ackCatalog(adapter, secondReqId);
-        adapter._triggerObject(0n, {
+        adapter._triggerObject(0n, { publisherPriority: 128,
           kind: 'data',
           trackAlias: secondReqId,
           groupId: varint(0),
@@ -979,7 +1098,7 @@ describe('MoqtPlayer', () => {
         expect(adapter.subscribe).toHaveBeenCalledTimes(4);
         const fourthReqId = await (adapter.subscribe as any).mock.results[3]?.value;
         ackCatalog(adapter, fourthReqId);
-        adapter._triggerObject(0n, {
+        adapter._triggerObject(0n, { publisherPriority: 128,
           kind: 'data',
           trackAlias: fourthReqId,
           groupId: varint(0),
@@ -1074,7 +1193,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       // Trigger a catalog object
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -1097,7 +1216,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       // First catalog
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -1107,7 +1226,7 @@ describe('MoqtPlayer', () => {
       } as MoqtObject);
 
       // Second catalog (independent, not delta)
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(1),
@@ -1123,7 +1242,7 @@ describe('MoqtPlayer', () => {
 
     it('ignores gap objects on catalog track', async () => {
       const adapter = createMockAdapter();
-      const player = await loadPlayer(adapter);
+      await loadPlayer(adapter);
 
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
@@ -1154,7 +1273,7 @@ describe('MoqtPlayer', () => {
       ackCatalog(adapter);
 
       // Trigger catalog
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -1187,7 +1306,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -1226,7 +1345,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -1252,7 +1371,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -1282,7 +1401,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -1317,7 +1436,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -1357,7 +1476,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -1403,7 +1522,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -1455,10 +1574,7 @@ describe('MoqtPlayer', () => {
       await resolveConnect(adapter);
 
       // ControlMessage types are UPPERCASE per messages.ts
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'https://new-relay.example.com/moq',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
       expect(fn).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -1468,7 +1584,7 @@ describe('MoqtPlayer', () => {
       );
     });
 
-    it('UNSUBSCRIBES all active subscriptions on GOAWAY (§9.4 SHOULD)', async () => {
+    it('does NOT unsubscribe active subscriptions on GOAWAY receipt (§8.4.1 ordering)', async () => {
       // §9.4: "A subscriber SHOULD individually UNSUBSCRIBE for each
       // existing subscription"
       const adapter = createMockAdapter();
@@ -1481,7 +1597,7 @@ describe('MoqtPlayer', () => {
 
       ackCatalog(adapter);
       // Trigger catalog to create media subscriptions
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -1500,24 +1616,26 @@ describe('MoqtPlayer', () => {
         requestId: videoReqId,
         trackAlias: varint(50n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
       adapter._triggerMessage({
         type: 'SUBSCRIBE_OK',
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Receive GOAWAY
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'https://new-relay.example.com/moq',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
-      // §9.4 SHOULD: UNSUBSCRIBE called for each active media subscription
-      expect(adapter.unsubscribe).toHaveBeenCalledTimes(2);
+      // §9.4's "a subscriber SHOULD individually UNSUBSCRIBE" is ORDERED by
+      // graceful switchover (§8.4.1 / §9.4.1 / §7.4.1): the replacement's
+      // responses come first, "and if they are successful, the subscriptions to
+      // the old relay can be cancelled". Cancelling on receipt tore playback
+      // down while the replacement was still being established. Retirement now
+      // belongs to the handover, so nothing is cancelled here.
+      expect(adapter.unsubscribe).not.toHaveBeenCalled();
     });
 
     it('clears active subscriptions after GOAWAY UNSUBSCRIBE', async () => {
@@ -1531,7 +1649,7 @@ describe('MoqtPlayer', () => {
 
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -1542,10 +1660,7 @@ describe('MoqtPlayer', () => {
 
       player.play();
 
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: '',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
 
       (adapter.requestUpdate as any).mockClear();
       player.pause();
@@ -1567,7 +1682,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -1884,7 +1999,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -1973,7 +2088,7 @@ describe('MoqtPlayer', () => {
       // Allow microtask for async rejection to propagate
       await vi.waitFor(() => expect(errorFn).toHaveBeenCalled());
 
-      const err = errorFn.mock.calls[0][0];
+      const err = errorFn.mock.calls[0]![0];
       expect(err.type).toBe('error');
     });
 
@@ -1992,7 +2107,7 @@ describe('MoqtPlayer', () => {
       player.pause();
       await vi.waitFor(() => expect(errorFn).toHaveBeenCalled());
 
-      const err = errorFn.mock.calls[0][0];
+      const err = errorFn.mock.calls[0]![0];
       expect(err.type).toBe('error');
     });
 
@@ -2031,7 +2146,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2049,7 +2164,7 @@ describe('MoqtPlayer', () => {
         requestId: videoReqId,
         trackAlias: varint(50n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       adapter._triggerMessage({
@@ -2057,7 +2172,7 @@ describe('MoqtPlayer', () => {
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       return player;
@@ -2128,7 +2243,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2143,7 +2258,7 @@ describe('MoqtPlayer', () => {
         requestId: videoReqId,
         trackAlias: varint(50n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       return player;
@@ -2188,7 +2303,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2203,7 +2318,7 @@ describe('MoqtPlayer', () => {
     it('calls adapter.unsubscribe on corrupted LOC extensions (§2.4.2)', async () => {
       // §2.4.2: Corrupted LOC extensions = malformed track → MUST UNSUBSCRIBE
       const adapter = createMockAdapter();
-      const player = await loadCatalogAndSubscribe(adapter);
+      await loadCatalogAndSubscribe(adapter);
 
       const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
 
@@ -2212,11 +2327,11 @@ describe('MoqtPlayer', () => {
         requestId: videoReqId,
         trackAlias: varint(42n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Corrupted extensions — LOC parse error triggers malformed track
-      adapter._triggerObject(1n, {
+      adapter._triggerObject(1n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(42n),
         groupId: varint(1),
@@ -2242,7 +2357,7 @@ describe('MoqtPlayer', () => {
         requestId: videoReqId,
         trackAlias: varint(42n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Set up a transform that throws (simulates E2EE decryption failure)
@@ -2250,7 +2365,7 @@ describe('MoqtPlayer', () => {
         throw new Error('Decryption failed');
       };
 
-      adapter._triggerObject(1n, {
+      adapter._triggerObject(1n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(42n),
         groupId: varint(1),
@@ -2278,7 +2393,7 @@ describe('MoqtPlayer', () => {
         requestId: videoReqId,
         trackAlias: varint(42n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Transform throws → malformed track (non-LOC error path)
@@ -2286,7 +2401,7 @@ describe('MoqtPlayer', () => {
         throw new Error('Decryption failed');
       };
 
-      adapter._triggerObject(1n, {
+      adapter._triggerObject(1n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(42n),
         groupId: varint(1),
@@ -2318,7 +2433,7 @@ describe('MoqtPlayer', () => {
         requestId: videoReqId,
         trackAlias: varint(42n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Transform throws → malformed track → UNSUBSCRIBE (non-LOC error path)
@@ -2326,7 +2441,7 @@ describe('MoqtPlayer', () => {
         throw new Error('Decryption failed');
       };
 
-      adapter._triggerObject(1n, {
+      adapter._triggerObject(1n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(42n),
         groupId: varint(1),
@@ -2363,7 +2478,7 @@ describe('MoqtPlayer', () => {
 
       ackCatalog(adapter);
       // Trigger catalog to create media subscriptions
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2394,7 +2509,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2423,7 +2538,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2452,7 +2567,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2482,7 +2597,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2508,7 +2623,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2561,7 +2676,7 @@ describe('MoqtPlayer', () => {
       });
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2607,7 +2722,7 @@ describe('MoqtPlayer', () => {
       const player = new MoqtPlayer({
         ...createConfig(adapter),
         createMediaSource: () => mockMs,
-        createCmafAssembler: (opts: any) => ({
+        createCmafAssembler: () => ({
           push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
         }),
       });
@@ -2646,7 +2761,7 @@ describe('MoqtPlayer', () => {
       const player = new MoqtPlayer({
         ...createConfig(adapter),
         createMediaSource: () => mockMs,
-        createCmafAssembler: (opts: any) => ({
+        createCmafAssembler: () => ({
           push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
         }),
       });
@@ -2715,7 +2830,7 @@ describe('MoqtPlayer', () => {
       const player = new MoqtPlayer({
         ...createConfig(adapter),
         createMediaSource: () => mockMs,
-        createCmafAssembler: (opts: any) => ({
+        createCmafAssembler: () => ({
           push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
         }),
         subscriptionFilter: { type: 'LargestObject' },
@@ -2780,7 +2895,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -2841,7 +2956,7 @@ describe('MoqtPlayer', () => {
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
       adapter._triggerObject(1n, {
         kind: 'data',
@@ -2867,13 +2982,48 @@ describe('MoqtPlayer', () => {
       const recoveryFactory = vi.fn(() => ({
         evaluate: vi.fn(() => ({ type: 'skip_forward' as const })),
       }));
-      const player = await loadWithCatalog(adapter, {
+      await loadWithCatalog(adapter, {
         ...createConfig(adapter),
         clock: mockClock,
         createRecoveryController: recoveryFactory,
       });
 
       expect(recoveryFactory).toHaveBeenCalledWith(mockClock);
+    });
+
+    it('a gap skip continues from the buffered group — no resubscribe from the live edge', async () => {
+      // One missing audio group under congestion must not jump audio over the
+      // link's backlog: the pipeline already holds the group it skips to, and
+      // a live-edge resubscribe would land audio seconds ahead of video.
+      const adapter = createMockAdapter();
+      const player = await loadWithCatalog(adapter);
+      const skips: unknown[] = [];
+      player.on('skip_forward', e => skips.push(e));
+      const audioReqId = await (adapter.subscribe as any).mock.results[2]?.value;
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: audioReqId, trackAlias: varint(51n),
+        parameters: new Map(), trackExtensions: new Map(),
+      } as ControlMessage);
+      const audio = (group: number) => adapter._triggerObject(BigInt(group + 1), {
+        kind: 'data', trackAlias: varint(51n), groupId: varint(group), subgroupId: varint(0),
+        objectId: varint(0), payload: new Uint8Array([0xAA]), extensions: undefined, publisherPriority: 128,
+      } as MoqtObject);
+
+      clockTime = 1_000_000;
+      audio(0);
+      player.tick();
+      audio(2); // group 1 never arrives
+      for (let i = 0; i < 100 && skips.length === 0; i++) {
+        clockTime += 100_000;
+        player.tick();
+      }
+      await new Promise(r => setTimeout(r, 0));
+
+      expect(skips.length).toBeGreaterThan(0);
+      const liveEdge = (adapter.requestUpdate as any).mock.calls.filter((c: any[]) =>
+        BigInt(c[0]) === BigInt(audioReqId) && c[1]?.subscriptionFilter?.type === 'NextGroupStart');
+      expect(liveEdge).toEqual([]);
+      await player.destroy();
     });
 
     it('emits decoder_command for audio decode after tick', async () => {
@@ -2893,7 +3043,7 @@ describe('MoqtPlayer', () => {
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Trigger audio object with payload (groupId 0 = first expected group)
@@ -2934,7 +3084,7 @@ describe('MoqtPlayer', () => {
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       adapter._triggerObject(1n, {
@@ -2970,7 +3120,7 @@ describe('MoqtPlayer', () => {
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       clockTime = 1_000_000;
@@ -3008,7 +3158,7 @@ describe('MoqtPlayer', () => {
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       clockTime = 1_000_000;
@@ -3042,7 +3192,7 @@ describe('MoqtPlayer', () => {
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Push a normal object first so pipeline has consumed something
@@ -3094,7 +3244,7 @@ describe('MoqtPlayer', () => {
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Push 2 objects into a buffer of size 1 → overflow → recovery
@@ -3207,6 +3357,43 @@ describe('MoqtPlayer', () => {
       expect(createAudioDecoder).toHaveBeenCalledOnce();
       expect(createRenderer).toHaveBeenCalledOnce();
       expect(createAudioOutput).toHaveBeenCalledOnce();
+    });
+
+    it('exposes optional renderer draw evidence through the catalog-created pipeline', async () => {
+      const adapter = createMockAdapter();
+      const renderer = {
+        enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+        onFirstFrame: null, onFrameRendered: null, onStall: null,
+        videoPresentation: null as import('./interfaces.js').VideoPresentation | null,
+      };
+      const player = await loadWithCatalog(adapter, {
+        ...createPipelineConfig(adapter),
+        createRenderer: () => renderer,
+        createVideoDecoder: () => ({
+          configure: vi.fn(), decode: vi.fn(), flush: vi.fn(async () => {}),
+          reset: vi.fn(), queueDepth: 0, onFrame: null, onError: null, destroy: vi.fn(),
+        }),
+      });
+      try {
+        expect(player.videoPresentation).toBeNull();
+        renderer.videoPresentation = {
+          frameTimestampUs: 0n, timestampDomain: 'unknown', renderedAtUs: 123,
+        };
+        expect(player.videoPresentation).toEqual(renderer.videoPresentation);
+        expect(player.videoPresentation).not.toBe(renderer.videoPresentation);
+      } finally {
+        await player.destroy();
+      }
+      expect(player.videoPresentation).toBeNull();
+    });
+
+    it('has no video presentation without an instrumented renderer', async () => {
+      const player = await loadWithCatalog(createMockAdapter());
+      try {
+        expect(player.videoPresentation).toBeNull();
+      } finally {
+        await player.destroy();
+      }
     });
 
     // The stall metric only means something if the player actually wires both
@@ -3338,7 +3525,7 @@ describe('MoqtPlayer', () => {
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       clockTime = 1_000_000;
@@ -3457,7 +3644,7 @@ describe('MoqtPlayer', () => {
         requestId: audioReqId,
         trackAlias: varint(51n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       clockTime = 1_000_000;
@@ -3516,7 +3703,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -3557,7 +3744,7 @@ describe('MoqtPlayer', () => {
       const { player } = await loadWithCatalog(adapter);
 
       // Get the video track alias from the subscription
-      const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+      await (adapter.subscribe as any).mock.results[1]?.value;
 
       // Initiate fetch
       const fetchReqId = await player.fetch('video', {
@@ -3576,7 +3763,7 @@ describe('MoqtPlayer', () => {
 
       // Simulate a fetch object arriving on that stream
       // Fetch objects have trackAlias: 0 in the adapter
-      adapter._triggerObject(fetchStreamId, {
+      adapter._triggerObject(fetchStreamId, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(0),
         groupId: varint(5),
@@ -3625,7 +3812,7 @@ describe('MoqtPlayer', () => {
 
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -3648,7 +3835,7 @@ describe('MoqtPlayer', () => {
         type: 'fetch',
         header: { requestId: reqId },
       });
-      adapter._triggerObject(streamId, {
+      adapter._triggerObject(streamId, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(0),
         groupId: varint(0),
@@ -3786,7 +3973,8 @@ describe('MoqtPlayer', () => {
       const adapter = createMockAdapter();
       const { player } = await loadWithCatalog(adapter);
 
-      const snapshotBefore = JSON.stringify(player.catalogState);
+      expect((player as unknown as { _catalogState: CatalogState | null })._catalogState?.tracks.length).toBeGreaterThan(0);
+      const snapshotBefore = JSON.stringify((player as unknown as { _catalogState: CatalogState | null })._catalogState);
       const subscribeCallsBefore = (adapter.subscribe as any).mock.calls.length;
 
       // FETCH returns a DIFFERENT catalog — must NOT alter the running state.
@@ -3807,7 +3995,7 @@ describe('MoqtPlayer', () => {
 
       expect(fetched.tracks[0]?.name).toBe('different');
       // Running catalog untouched
-      expect(JSON.stringify(player.catalogState)).toBe(snapshotBefore);
+      expect(JSON.stringify((player as unknown as { _catalogState: CatalogState | null })._catalogState)).toBe(snapshotBefore);
       // No extra subscribes issued by fetchCatalog
       expect((adapter.subscribe as any).mock.calls.length).toBe(subscribeCallsBefore);
     });
@@ -3882,6 +4070,9 @@ describe('MoqtPlayer', () => {
       const newAdapter = createMockAdapter();
       const migratePromise = player.migrate(newAdapter);
       await resolveConnect(newAdapter);
+      // The replacement answers as soon as it can, which is what makes it
+      // adoptable; the handover then proceeds on its own.
+      await acceptReplacement(newAdapter);
       await migratePromise;
 
       const err = await settled;
@@ -3927,7 +4118,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -3948,6 +4139,9 @@ describe('MoqtPlayer', () => {
       const newAdapter = createMockAdapter();
       const migratePromise = player.migrate(newAdapter);
       await resolveConnect(newAdapter);
+      // The replacement answers as soon as it can, which is what makes it
+      // adoptable; the handover then proceeds on its own.
+      await acceptReplacement(newAdapter);
       await migratePromise;
 
       // New adapter should have connect called
@@ -3971,6 +4165,9 @@ describe('MoqtPlayer', () => {
       const newAdapter = createMockAdapter();
       const migratePromise = player.migrate(newAdapter);
       await resolveConnect(newAdapter);
+      // The replacement answers as soon as it can, which is what makes it
+      // adoptable; the handover then proceeds on its own.
+      await acceptReplacement(newAdapter);
       await migratePromise;
 
       // Old adapter should be closed
@@ -3986,6 +4183,9 @@ describe('MoqtPlayer', () => {
       const newAdapter = createMockAdapter();
       const migratePromise = player.migrate(newAdapter);
       await resolveConnect(newAdapter);
+      // The replacement answers as soon as it can, which is what makes it
+      // adoptable; the handover then proceeds on its own.
+      await acceptReplacement(newAdapter);
       await migratePromise;
 
       expect(fn).toHaveBeenCalledWith(
@@ -4001,10 +4201,7 @@ describe('MoqtPlayer', () => {
       const fn = vi.fn();
       player.on('session_goaway', fn);
 
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: '',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
 
       expect(fn).toHaveBeenCalled();
       // No new connect should have happened
@@ -4015,7 +4212,7 @@ describe('MoqtPlayer', () => {
       // §8.4.1: "starts the process of connecting to a new relay"
       const oldAdapter = createMockAdapter();
       const newAdapter = createMockAdapter();
-      const createTransport = vi.fn(async () => ({} as any));
+      const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({} as any));
       let adapterCallCount = 0;
       const createConnection = vi.fn(() => {
         adapterCallCount++;
@@ -4036,7 +4233,7 @@ describe('MoqtPlayer', () => {
 
       const catalogReqId = await (oldAdapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(oldAdapter);
-      oldAdapter._triggerObject(0n, {
+      oldAdapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -4046,10 +4243,7 @@ describe('MoqtPlayer', () => {
       } as MoqtObject);
 
       // Trigger GOAWAY with new URI
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'https://new-relay.example.com/moq',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
       // Resolve new adapter connect
       await resolveConnect(newAdapter);
@@ -4072,7 +4266,7 @@ describe('MoqtPlayer', () => {
     it('GOAWAY migration falls back to config.url if GOAWAY has no URI', async () => {
       const oldAdapter = createMockAdapter();
       const newAdapter = createMockAdapter();
-      const createTransport = vi.fn(async () => ({} as any));
+      const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({} as any));
       let adapterCallCount = 0;
       const createConnection = vi.fn(() => {
         adapterCallCount++;
@@ -4091,7 +4285,7 @@ describe('MoqtPlayer', () => {
 
       const catalogReqId = await (oldAdapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(oldAdapter);
-      oldAdapter._triggerObject(0n, {
+      oldAdapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -4101,10 +4295,7 @@ describe('MoqtPlayer', () => {
       } as MoqtObject);
 
       // Trigger GOAWAY with empty URI — should fall back to config.url
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: '',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
 
       await resolveConnect(newAdapter);
       await new Promise(r => setTimeout(r, 0));
@@ -4112,7 +4303,7 @@ describe('MoqtPlayer', () => {
       // createTransport should have been called with the fallback URL (config.url)
       // The second call should use the original relay URL
       expect(createTransport.mock.calls.length).toBeGreaterThanOrEqual(2);
-      const fallbackUrl = createTransport.mock.calls[createTransport.mock.calls.length - 1][0];
+      const fallbackUrl = createTransport.mock.calls[createTransport.mock.calls.length - 1]![0];
       expect(fallbackUrl).toContain('relay.example.com');
     });
 
@@ -4127,7 +4318,7 @@ describe('MoqtPlayer', () => {
     async function loadWithFactories() {
       const oldAdapter = createMockAdapter();
       const newAdapter = createMockAdapter();
-      const createTransport = vi.fn(async () => ({} as any));
+      const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({} as any));
       let adapterCallCount = 0;
       const createConnection = vi.fn(() => {
         adapterCallCount++;
@@ -4145,7 +4336,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
       const catalogReqId = await (oldAdapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(oldAdapter);
-      oldAdapter._triggerObject(0n, {
+      oldAdapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -4165,10 +4356,7 @@ describe('MoqtPlayer', () => {
       player.on('error', (e) => errors.push(e));
 
       // Observed in the field: a relay putting its parser-error text in the field.
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'Protocol violation: Invalid parameter delta 0 after first parameter',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'Protocol violation: Invalid parameter delta 0 after first parameter' });
       await new Promise((r) => setTimeout(r, 0));
 
       expect(createConnection.mock.calls.length).toBe(baseConnections); // no candidate
@@ -4184,10 +4372,7 @@ describe('MoqtPlayer', () => {
       const errors: any[] = [];
       player.on('error', (e) => errors.push(e));
 
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'http://insecure.example.com/moq', // WebTransport requires https
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'http://insecure.example.com/moq' }); // WebTransport requires https
       await new Promise((r) => setTimeout(r, 0));
 
       expect(createConnection.mock.calls.length).toBe(baseConnections);
@@ -4206,7 +4391,7 @@ describe('MoqtPlayer', () => {
         const errors: any[] = [];
         player.on('error', (e) => errors.push(e));
 
-        oldAdapter._triggerMessage({ type: 'GOAWAY', newSessionUri: uri } as ControlMessage);
+        oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: uri });
         await new Promise((r) => setTimeout(r, 0));
 
         expect(createConnection.mock.calls.length).toBe(baseConnections);
@@ -4221,15 +4406,12 @@ describe('MoqtPlayer', () => {
       const updated = vi.fn();
       player.on('catalog_updated', updated);
 
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'not a uri at all',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'not a uri at all' });
       await new Promise((r) => setTimeout(r, 0));
 
       // A parseable catalog object arriving on the GOAWAY'd session must not
       // mutate catalog state — the rejected migration does not lift quarantine.
-      oldAdapter._triggerObject(1n, {
+      oldAdapter._triggerObject(1n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(1),
@@ -4258,10 +4440,7 @@ describe('MoqtPlayer', () => {
 
       // The old session (still current until commit) sends its one GOAWAY,
       // carrying garbage — it is queued, not acted on.
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'definitely not a webtransport url',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'definitely not a webtransport url' });
       await new Promise((r) => setTimeout(r, 0));
       expect(createConnection.mock.calls.length).toBe(baseConnections); // nothing created for the GOAWAY
 
@@ -4281,6 +4460,146 @@ describe('MoqtPlayer', () => {
     });
   });
 
+  // ─── Graceful handover: prepare the replacement before retiring playback ───
+  //
+  // 16 §3.5 / §8.4.1, 18 §3.6 / §9.4.1, 22 §6.6.1 / §7.4.1: a subscriber that
+  // migrates "starts the process of connecting to a new relay and sending the
+  // SUBSCRIBE requests for all Established subscriptions to the new relay. The
+  // new relay will send a response to the subscribes and IF THEY ARE
+  // SUCCESSFUL, the subscriptions to the old relay can be cancelled."
+  // Response first, then cancel. These pin that ordering.
+  describe('graceful handover readiness (§8.4.1 / §9.4.1 / §7.4.1)', () => {
+    async function loadWithCandidate() {
+      const oldAdapter = createMockAdapter();
+      const newAdapter = createMockAdapter();
+      const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({}) as never);
+      let n = 0;
+      const createConnection = vi.fn(() =>
+        (n++ === 0 ? oldAdapter : newAdapter) as unknown as MoqtConnection);
+      const player = new MoqtPlayer({
+        url: 'https://old.example.com/moq',
+        namespace: 'live/broadcast',
+        createConnection,
+        createTransport,
+        catalogBootstrap: 'subscribe',
+      } as MoqtPlayerConfig);
+      const loadPromise = player.load();
+      await resolveConnect(oldAdapter);
+      await loadPromise;
+
+      // Establish the catalog and its media subscriptions on the old session.
+      const catalogReqId = await (oldAdapter.subscribe as never as {
+        mock: { results: Array<{ value: Promise<bigint> }> };
+      }).mock.results[0]!.value;
+      ackCatalog(oldAdapter, BigInt(catalogReqId));
+      oldAdapter._triggerObject(0n, { publisherPriority: 128,
+        kind: 'data', trackAlias: catalogReqId,
+        groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        payload: new TextEncoder().encode(CATALOG_JSON),
+      } as MoqtObject);
+      await ackMedia(oldAdapter);
+      const mediaIds = await Promise.all(
+        vi.mocked(oldAdapter.subscribe).mock.results.slice(1).map((r) => r.value),
+      );
+      expect(mediaIds.length).toBeGreaterThan(0);
+      vi.mocked(oldAdapter.unsubscribe).mockClear();
+      return {
+        player, oldAdapter, newAdapter, createTransport, mediaIds,
+        current: () => (player as unknown as { connection: unknown }).connection,
+      };
+    }
+
+    it('does not cancel established media on GOAWAY before the replacement is usable', async () => {
+      const h = await loadWithCandidate();
+      // Park the candidate at its catalog subscribe, so the replacement is
+      // provably not usable yet.
+      const parked = new Promise<never>(() => {});
+      h.newAdapter.subscribe = vi.fn<MoqtConnection['subscribe']>(() => parked as never);
+
+      h.oldAdapter._triggerGoawayNotice({
+        scope: 'session', newSessionUri: 'https://new.example.com/moq',
+      });
+      // Let the candidate genuinely reach its parked catalog subscribe, so the
+      // schedule under test is "replacement in progress", not "never started".
+      await resolveConnect(h.newAdapter);
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+
+      // §8.4.1: old subscriptions are cancelled only after the NEW relay's
+      // responses succeed. Nothing is usable yet, so nothing may be cancelled.
+      expect(vi.mocked(h.oldAdapter.unsubscribe).mock.calls).toEqual([]);
+      await h.player.destroy();
+    });
+
+    it('does not adopt the replacement until its catalog subscribe is answered', async () => {
+      const h = await loadWithCandidate();
+      // The send completes, but the peer never answers: no SUBSCRIBE_OK and no
+      // catalog object. A local write is not a successful response.
+      h.newAdapter.subscribe = vi.fn<MoqtConnection['subscribe']>(async () => varint(0n));
+
+      h.oldAdapter._triggerGoawayNotice({
+        scope: 'session', newSessionUri: 'https://new.example.com/moq',
+      });
+      await resolveConnect(h.newAdapter);
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+
+      // The subscribe was genuinely sent; only the RESPONSE is missing.
+      expect(h.newAdapter.subscribe).toHaveBeenCalled();
+      expect(h.current()).toBe(h.oldAdapter);
+      await h.player.destroy();
+    });
+
+    it('keeps the old session when the replacement refuses the catalog subscribe', async () => {
+      const h = await loadWithCandidate();
+      h.newAdapter.subscribe = vi.fn<MoqtConnection['subscribe']>(async () => {
+        const id = varint(0n);
+        queueMicrotask(() => {
+          h.newAdapter._triggerMessage({
+            type: 'REQUEST_ERROR', requestId: id, errorCode: varint(0x4n),
+            errorReason: 'track not found', parameters: new Map(),
+          } as unknown as ControlMessage);
+        });
+        return id;
+      });
+
+      h.oldAdapter._triggerGoawayNotice({
+        scope: 'session', newSessionUri: 'https://new.example.com/moq',
+      });
+      await resolveConnect(h.newAdapter);
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+
+      // A refused candidate is not a migration: the old peer is still usable.
+      expect(h.current()).toBe(h.oldAdapter);
+      expect(vi.mocked(h.oldAdapter.unsubscribe).mock.calls).toEqual([]);
+      await h.player.destroy();
+    });
+
+    it('reuses the CURRENT endpoint for an empty New Session URI after A to B', async () => {
+      const h = await loadWithCandidate();
+      // A -> B.
+      h.oldAdapter._triggerGoawayNotice({
+        scope: 'session', newSessionUri: 'https://b.example.com/moq',
+      });
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+      await resolveConnect(h.newAdapter);
+      // B becomes the current session only once it is usable, which is what
+      // makes its own New Session URI the one to reuse.
+      await acceptReplacement(h.newAdapter);
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+
+      const afterFirst = h.createTransport.mock.calls.length;
+      // An empty URI on B means "reuse the CURRENT session URI" (§9.4 / §10.4 /
+      // §9.2) — which is B, not the originally configured A.
+      h.newAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+
+      const targets = h.createTransport.mock.calls.slice(afterFirst).map((c) => String(c[0]));
+      expect(targets.length).toBeGreaterThan(0);
+      expect(targets.every((t) => t.includes('b.example.com'))).toBe(true);
+      await h.player.destroy();
+    });
+  });
+
+
   // ─── SUBSCRIBE_NAMESPACE (§6.1, §9.25) ─────────────────────────
 
   /**
@@ -4299,7 +4618,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -4375,7 +4694,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -4422,7 +4741,7 @@ describe('MoqtPlayer', () => {
       adapter._triggerMessage({
         type: 'REQUEST_OK',
         requestId: reqId,
-        parameters: new Map([[0x01n, new Uint8Array([0x05])]]),
+        parameters: new Map([[0x01n, [new Uint8Array([0x05])]]]),
       } as ControlMessage);
 
       const result = await statusPromise;
@@ -4699,7 +5018,6 @@ describe('MoqtPlayer', () => {
         onFrameRendered: null as ((ts: bigint, r: number) => void) | null,
         onStall: null as ((ms: number) => void) | null,
       };
-      let capturedOnError: ((mediaType: string, error: Error) => void) | null = null;
       const videoDecoder = {
         configure: vi.fn(), decode: vi.fn(), flush: vi.fn(() => Promise.resolve()),
         reset: vi.fn(), queueDepth: 0,
@@ -4721,7 +5039,7 @@ describe('MoqtPlayer', () => {
       // Deliver catalog to trigger pipeline+dispatcher creation
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -4768,7 +5086,7 @@ describe('MoqtPlayer', () => {
 
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -4800,7 +5118,7 @@ describe('MoqtPlayer', () => {
       // Send invalid catalog JSON
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -4826,7 +5144,7 @@ describe('MoqtPlayer', () => {
 
       ackCatalog(adapter);
       // First: deliver valid catalog
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -4839,7 +5157,7 @@ describe('MoqtPlayer', () => {
       player.on('error', (e) => errors.push(e));
 
       // Second: deliver invalid catalog (delta update)
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(1),
@@ -4982,7 +5300,7 @@ describe('MoqtPlayer', () => {
       (adapter.subscribe as any).mockRejectedValueOnce(new Error('subscribe boom'));
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1n),
         groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
@@ -5128,8 +5446,8 @@ describe('MoqtPlayer', () => {
     it('logLevel "debug" logs per-object delivery', async () => {
       const spyDebug = vi.spyOn(console, 'debug').mockImplementation(() => {});
       const spyInfo = vi.spyOn(console, 'info').mockImplementation(() => {});
-      const spyWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const spyError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(console, 'error').mockImplementation(() => {});
 
       const adapter = createMockAdapter();
       const player = new MoqtPlayer({
@@ -5209,7 +5527,7 @@ describe('MoqtPlayer', () => {
 
     it('degraded error logs via console.warn at logLevel "warn"', async () => {
       const spyWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const spyInfo = vi.spyOn(console, 'info').mockImplementation(() => {});
+      vi.spyOn(console, 'info').mockImplementation(() => {});
 
       const adapter = createMockAdapter();
       const player = new MoqtPlayer({
@@ -5272,7 +5590,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       // Simulate adapter emitting a qlog event
-      adapter.onQlogEvent?.({ type: 'control_message_parsed', message: { type: 'GOAWAY' } });
+      adapter.onQlogEvent?.({ type: 'control_message_parsed', stream_id: 0n, message: { type: 'GOAWAY', newSessionUri: '' } });
       expect(qlogEvents).toHaveLength(1);
       expect(qlogEvents[0].type).toBe('control_message_parsed');
     });
@@ -5394,7 +5712,7 @@ describe('MoqtPlayer', () => {
 
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -5481,7 +5799,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(1),
         subgroupId: varint(0),
         objectId: varint(0),
-        publisherPriority: varint(0),
+        publisherPriority: 0,
         extensions: new Uint8Array(0),
         payload: new Uint8Array(512),
       } as MoqtObject);
@@ -5504,7 +5822,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(1),
         subgroupId: varint(0),
         objectId: varint(0),
-        publisherPriority: varint(0),
+        publisherPriority: 0,
         status: varint(0x1), // END_OF_GROUP
       } as MoqtObject);
 
@@ -5598,7 +5916,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(2),
         subgroupId: varint(0),
         objectId: varint(0),
-        publisherPriority: varint(0),
+        publisherPriority: 0,
         extensions: new Uint8Array(0),
         payload: new Uint8Array(256),
       } as MoqtObject);
@@ -5639,7 +5957,7 @@ describe('MoqtPlayer', () => {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -5688,7 +6006,7 @@ describe('MoqtPlayer', () => {
         requestId: videoReqId,
         trackAlias: varint(50n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Simulate decode error via video decoder's onError callback
@@ -5785,7 +6103,7 @@ describe('MoqtPlayer', () => {
         requestId: videoReqId,
         trackAlias: varint(50n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Push a video object
@@ -5891,7 +6209,7 @@ describe('MoqtPlayer', () => {
 
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -5912,7 +6230,7 @@ describe('MoqtPlayer', () => {
 
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -5933,7 +6251,7 @@ describe('MoqtPlayer', () => {
       } as unknown as ControlMessage);
 
       // Send a media object on the video alias
-      adapter._triggerObject(1n, {
+      adapter._triggerObject(1n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(2),
         groupId: varint(1),
@@ -6136,7 +6454,7 @@ describe('MoqtPlayer', () => {
 
       ackCatalog(adapter);
       // Trigger catalog — subscribeToMediaTracks fires with Promise.all
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -6286,7 +6604,7 @@ describe('MoqtPlayer', () => {
         requestId: videoReqId,
         trackAlias: varint(50n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Send a video object — should route to pre-created pipeline
@@ -6340,7 +6658,7 @@ describe('MoqtPlayer', () => {
         requestId: catalogReqId,
         trackAlias: varint(1n),
         parameters: new Map(),
-        trackExtensions: [],
+        trackExtensions: new Map(),
       } as ControlMessage);
 
       // Simulate a data object with alias=99 (unknown — maybe a server-remapped
@@ -6403,7 +6721,7 @@ describe('MoqtPlayer', () => {
       // Now trigger catalog arrival
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -6449,7 +6767,7 @@ describe('MoqtPlayer', () => {
       // Trigger catalog
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -6485,7 +6803,7 @@ describe('MoqtPlayer', () => {
       // Trigger catalog — now media subscriptions happen
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -6708,7 +7026,7 @@ describe('MoqtPlayer', () => {
      * Matches CmafAssemblerLike interface without importing @openmoq/browser.
      */
     function createCmafAssemblerFactory() {
-      return (options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void }) => {
+      return (options: Parameters<NonNullable<MoqtPlayerConfig['createCmafAssembler']>>[0]) => {
         const pending = new Map<string, Uint8Array>();
         return {
           push(mediaType: 'video' | 'audio', trackName: string, groupId: bigint, payload: Uint8Array) {
@@ -6726,7 +7044,7 @@ describe('MoqtPlayer', () => {
                 const seg = new Uint8Array(moof.byteLength + payload.byteLength);
                 seg.set(moof, 0);
                 seg.set(payload, moof.byteLength);
-                options.onSegment(mediaType, seg, trackName);
+                options.onSegment(mediaType, seg, trackName, groupId);
               }
             }
           },
@@ -7260,7 +7578,7 @@ describe('MoqtPlayer', () => {
       const onTimeout = (wd as { onTimeout?: (e: unknown) => void }).onTimeout
         ?? ((wd as { config?: { onTimeout?: (e: unknown) => void } }).config?.onTimeout);
       expect(typeof onTimeout).toBe('function');
-      onTimeout!({ event: 'catalog_received', elapsedMs: 10_000, timeoutMs: 10_000 });
+      onTimeout!({ event: 'first_media_object', elapsedMs: 20_000, timeoutMs: 20_000 });
 
       expect(seenA).toEqual(seenB);
       expect(seenA).toEqual([PlayerState.PLAYING, PlayerState.PAUSED]);
@@ -7327,7 +7645,7 @@ describe('MoqtPlayer', () => {
       const createVideoDecoder = vi.fn();
       const createAudioDecoder = vi.fn(() => ({ configure: vi.fn(), decode: vi.fn(), flush: vi.fn(() => Promise.resolve()), reset: vi.fn(), queueDepth: 0, onFrame: null, onData: null, onError: null, destroy: vi.fn() }));
       const createRenderer = vi.fn();
-      const createAudioOutput = vi.fn(() => ({ schedule: vi.fn(), flush: vi.fn(), destroy: vi.fn() }));
+      const createAudioOutput = vi.fn(() => ({ schedule: vi.fn(), flush: vi.fn(), destroy: vi.fn(), currentPlayoutTimeUs: 0 }));
 
       const player = new MoqtPlayer({
         ...createConfig(adapter), createMediaSource: () => mockMs, createCmafAssembler: createCmafAssemblerFactory(),
@@ -7918,6 +8236,12 @@ describe('MoqtPlayer', () => {
       ],
     });
 
+    /** The same catalog with the timeline declaring BOTH selected media tracks (MSF-01 §7.2 depends lists every
+     *  track the timeline applies to); a synchronized seek requires coverage of every selected media track. */
+    const VOD_CATALOG_FULL_COVERAGE_JSON = JSON.stringify({ ...JSON.parse(VOD_CATALOG_JSON) as { tracks: Array<Record<string, unknown>> },
+      tracks: (JSON.parse(VOD_CATALOG_JSON) as { tracks: Array<Record<string, unknown>> }).tracks.map(track =>
+        track['packaging'] === 'mediatimeline' ? { ...track, depends: ['video', 'audio'] } : track) });
+
     /** Timeline payload: 5 entries at 2s intervals. §7.1 */
     const TIMELINE_PAYLOAD = JSON.stringify([
       [0, [0, 0], 0],
@@ -7935,16 +8259,16 @@ describe('MoqtPlayer', () => {
       return player;
     }
 
-    async function sendVodCatalog(adapter: ReturnType<typeof createMockAdapter>) {
+    async function sendVodCatalog(adapter: ReturnType<typeof createMockAdapter>, catalog = VOD_CATALOG_JSON) {
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new TextEncoder().encode(VOD_CATALOG_JSON),
+        payload: new TextEncoder().encode(catalog),
       } as MoqtObject);
       await new Promise(r => setTimeout(r, 10));
       await ackMedia(adapter);
@@ -7969,7 +8293,7 @@ describe('MoqtPlayer', () => {
       // Send regular catalog (no timeline track)
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -7997,7 +8321,7 @@ describe('MoqtPlayer', () => {
       const timelineReqId = await (adapter.subscribe as any).mock.results[3]?.value;
 
       // Send timeline object
-      adapter._triggerObject(10n, {
+      adapter._triggerObject(10n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: timelineReqId,
         groupId: varint(0),
@@ -8045,10 +8369,10 @@ describe('MoqtPlayer', () => {
       const adapter = createMockAdapter();
       const player = await loadVodPlayer(adapter);
 
-      await sendVodCatalog(adapter);
+      await sendVodCatalog(adapter, VOD_CATALOG_FULL_COVERAGE_JSON);
 
       const timelineReqId = await (adapter.subscribe as any).mock.results[3]?.value;
-      adapter._triggerObject(10n, {
+      adapter._triggerObject(10n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: timelineReqId,
         groupId: varint(0),
@@ -8063,143 +8387,55 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
+    it('control — a timeline covering only the video track does not make a player with selected audio seekable', async () => {
+      const adapter = createMockAdapter();
+      const player = await loadVodPlayer(adapter);
+      await sendVodCatalog(adapter);                                 // depends: ['video'] only
+      const timelineReqId = await (adapter.subscribe as any).mock.results[3]?.value;
+      adapter._triggerObject(10n, { publisherPriority: 128,
+        kind: 'data', trackAlias: timelineReqId, groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        payload: new TextEncoder().encode(TIMELINE_PAYLOAD),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 10));
+      expect(player.seekable).toBe(false);
+      player.play();                                                  // past the state guard: the refusal is the coverage one
+      await expect(player.seek(3000)).rejects.toThrow(/audio track "audio" is not covered by the media timeline/);
+      await player.destroy();
+    });
+
     // ── seek() tests (§9.2.2.5 — REQUEST_UPDATE with SUBSCRIPTION_FILTER) ──
 
-    it('seek() sends REQUEST_UPDATE with AbsoluteStart for media subscriptions (§9.2.2.5)', async () => {
+    // The three REQUEST_UPDATE / pipeline.reset seek mechanism cases that lived here are retired: seeking is
+    // output-owned historical retrieval (FETCH into a fresh owned output), not an optimistic live-subscription update.
+    // Their user-facing claims live in the owned-seek suites.
+    it('an otherwise eligible LOC seek without createFrameOutput is refused before any output, REQUEST_UPDATE or FETCH mutation', async () => {
       const adapter = createMockAdapter();
       const player = await loadVodPlayer(adapter);
-
-      await sendVodCatalog(adapter);
-
-      // Establish media subscriptions (video + audio)
-      const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
-      const audioReqId = await (adapter.subscribe as any).mock.results[2]?.value;
-      adapter._triggerMessage({
-        type: 'SUBSCRIBE_OK',
-        requestId: videoReqId,
-        trackAlias: videoReqId,
-        parameters: new Map(),
-      } as unknown as ControlMessage);
-      adapter._triggerMessage({
-        type: 'SUBSCRIBE_OK',
-        requestId: audioReqId,
-        trackAlias: audioReqId,
-        parameters: new Map(),
-      } as unknown as ControlMessage);
-
-      // Load timeline
-      const timelineReqId = await (adapter.subscribe as any).mock.results[3]?.value;
-      adapter._triggerObject(10n, {
-        kind: 'data',
-        trackAlias: timelineReqId,
-        groupId: varint(0),
-        subgroupId: varint(0),
-        objectId: varint(0),
-        payload: new TextEncoder().encode(TIMELINE_PAYLOAD),
-      } as MoqtObject);
-      await new Promise(r => setTimeout(r, 10));
-
-      // Play first
-      player.play();
-
-      // Seek to 5 seconds — should target group 2 (4000ms <= 5000ms)
-      await player.seek(5000);
-
-      // requestUpdate calls: 2 from play() + 2 from seek()
-      // seek sends REQUEST_UPDATE with subscriptionFilter for video + audio
-      const seekCalls = adapter.requestUpdate.mock.calls.filter(
-        (call: any[]) => call[1]?.subscriptionFilter !== undefined
-      );
-      expect(seekCalls.length).toBe(2); // one for video, one for audio
-
-      // Verify filter uses AbsoluteStart with group 2
-      expect(seekCalls[0][1].subscriptionFilter).toEqual(
-        expect.objectContaining({
-          type: 'AbsoluteStart',
-        }),
-      );
-
-      await player.destroy();
-    });
-
-    it('seek() emits seeking event (§7)', async () => {
-      const adapter = createMockAdapter();
-      const player = await loadVodPlayer(adapter);
-      const fn = vi.fn();
-      player.on('seeking', fn);
-
-      await sendVodCatalog(adapter);
-
-      // Establish subscriptions
+      const seeking = vi.fn(); player.on('seeking', seeking);
+      await sendVodCatalog(adapter, VOD_CATALOG_FULL_COVERAGE_JSON);   // coverage satisfied: the refusal must be the capability one
       const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
       const audioReqId = await (adapter.subscribe as any).mock.results[2]?.value;
       adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as unknown as ControlMessage);
       adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: audioReqId, trackAlias: audioReqId, parameters: new Map() } as unknown as ControlMessage);
-
-      // Load timeline
       const timelineReqId = await (adapter.subscribe as any).mock.results[3]?.value;
-      adapter._triggerObject(10n, {
-        kind: 'data',
-        trackAlias: timelineReqId,
-        groupId: varint(0),
-        subgroupId: varint(0),
-        objectId: varint(0),
+      adapter._triggerObject(10n, { publisherPriority: 128,
+        kind: 'data', trackAlias: timelineReqId, groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
         payload: new TextEncoder().encode(TIMELINE_PAYLOAD),
       } as MoqtObject);
       await new Promise(r => setTimeout(r, 10));
-
       player.play();
-      await player.seek(3000);
+      expect(player.seekable, 'premise: admissible target').toBe(true);
+      const videoPipeline = (player as any).videoPipeline, audioPipeline = (player as any).audioPipeline;
+      const videoResetSpy = vi.spyOn(videoPipeline, 'reset'), audioResetSpy = vi.spyOn(audioPipeline, 'reset');
+      (adapter.requestUpdate as any).mockClear();
 
-      expect(fn).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'seeking',
-          targetTimeMs: 3000,
-        }),
-      );
+      await expect(player.seek(5000)).rejects.toThrow(/createFrameOutput/);   // the capability refusal, not coverage or decoder seed
 
-      await player.destroy();
-    });
-
-    it('seek() passes target groupId to pipeline.reset() to reject stale objects (§9.11.1)', async () => {
-      const adapter = createMockAdapter();
-      const player = await loadVodPlayer(adapter);
-
-      await sendVodCatalog(adapter);
-
-      // Establish subscriptions
-      const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
-      const audioReqId = await (adapter.subscribe as any).mock.results[2]?.value;
-      adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as unknown as ControlMessage);
-      adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: audioReqId, trackAlias: audioReqId, parameters: new Map() } as unknown as ControlMessage);
-
-      // Load timeline
-      const timelineReqId = await (adapter.subscribe as any).mock.results[3]?.value;
-      adapter._triggerObject(10n, {
-        kind: 'data',
-        trackAlias: timelineReqId,
-        groupId: varint(0),
-        subgroupId: varint(0),
-        objectId: varint(0),
-        payload: new TextEncoder().encode(TIMELINE_PAYLOAD),
-      } as MoqtObject);
-      await new Promise(r => setTimeout(r, 10));
-
-      player.play();
-
-      // Spy on pipeline reset methods
-      const videoPipeline = (player as any).videoPipeline;
-      const audioPipeline = (player as any).audioPipeline;
-      const videoResetSpy = vi.spyOn(videoPipeline, 'reset');
-      const audioResetSpy = vi.spyOn(audioPipeline, 'reset');
-
-      // Seek to 5000ms → target group 2 (per timeline: group 2 starts at 4000ms)
-      await player.seek(5000);
-
-      // Pipeline reset should be called with target group ID (2n)
-      expect(videoResetSpy).toHaveBeenCalledWith(2n);
-      expect(audioResetSpy).toHaveBeenCalledWith(2n);
-
+      expect(seeking).not.toHaveBeenCalled();
+      expect(adapter.requestUpdate.mock.calls.filter((call: any[]) => call[1]?.subscriptionFilter !== undefined), 'no live-subscription rewrite').toEqual([]);
+      expect(adapter.fetch).not.toHaveBeenCalled();
+      expect(videoResetSpy).not.toHaveBeenCalled(); expect(audioResetSpy).not.toHaveBeenCalled();
+      expect(player.state, 'current output untouched').toBe(PlayerState.PLAYING);
       await player.destroy();
     });
 
@@ -8289,7 +8525,7 @@ describe('MoqtPlayer', () => {
 
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -8307,6 +8543,80 @@ describe('MoqtPlayer', () => {
       const player = await loadMultitrack(adapter);
       expect(typeof player.selectVideoTrack).toBe('function');
       await player.destroy();
+    });
+
+    describe('a selection while a switch is pending', () => {
+      const lastSubName = (adapter: ReturnType<typeof createMockAdapter>) =>
+        new TextDecoder().decode((adapter.subscribe as any).mock.calls.at(-1)[1]);
+      const unsubIds = (adapter: ReturnType<typeof createMockAdapter>) =>
+        (adapter.unsubscribe as any).mock.calls.map((c: unknown[]) => BigInt(c[0] as bigint));
+
+      it('unsubscribes the superseded target and stages only the newest one', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+        const failedFn = vi.fn();
+        player.on('quality_switch_failed', failedFn);
+
+        await player.selectVideoTrack('video-2');
+        const supersededReqId = BigInt(await (adapter.subscribe as any).mock.results.at(-1)!.value);
+        await player.selectVideoTrack('video-0');
+
+        expect(lastSubName(adapter)).toBe('video-0');
+        // The superseded target is gone: otherwise its objects, no longer
+        // staged, would reach the sink as ordinary media.
+        expect(unsubIds(adapter)).toEqual([supersededReqId]);
+        expect((player as any).pendingVideoSwitch.newTrackName).toBe('video-0');
+        expect((player as any).pendingVideoSwitch.oldTrackName).toBe('video-1');
+        expect(failedFn).toHaveBeenCalledTimes(1);
+        expect(failedFn.mock.calls[0]![0]).toMatchObject({ fromTrackName: 'video-1', toTrackName: 'video-2' });
+
+        await player.destroy();
+      });
+
+      it('repeating the pending target is a no-op', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+
+        await player.selectVideoTrack('video-2');
+        const subCount = (adapter.subscribe as any).mock.calls.length;
+        await player.selectVideoTrack('video-2');
+
+        expect((adapter.subscribe as any).mock.calls.length).toBe(subCount);
+        expect(adapter.unsubscribe).not.toHaveBeenCalled();
+
+        await player.destroy();
+      });
+
+      it('selecting the current track cancels the pending switch', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+
+        await player.selectVideoTrack('video-2');
+        const pendingReqId = BigInt(await (adapter.subscribe as any).mock.results.at(-1)!.value);
+        const subCount = (adapter.subscribe as any).mock.calls.length;
+        await player.selectVideoTrack('video-1');
+
+        expect((adapter.subscribe as any).mock.calls.length).toBe(subCount);
+        expect(unsubIds(adapter)).toEqual([pendingReqId]);
+        expect((player as any).pendingVideoSwitch).toBeNull();
+
+        await player.destroy();
+      });
+
+      it('rejects while the pending switch is committing', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+
+        await player.selectVideoTrack('video-2');
+        (player as any).switchInProgress = true;
+
+        await expect(player.selectVideoTrack('video-0')).rejects.toThrow(/is committing/);
+        expect((player as any).pendingVideoSwitch.newTrackName).toBe('video-2');
+        expect(adapter.unsubscribe).not.toHaveBeenCalled();
+
+        (player as any).switchInProgress = false;
+        await player.destroy();
+      });
     });
 
     it('selects middle quality video track by default from altGroup', async () => {
@@ -8352,7 +8662,7 @@ describe('MoqtPlayer', () => {
       } as any);
 
       // Simulate first object from new track using relay-assigned alias
-      adapter._triggerObject(99n, {
+      adapter._triggerObject(99n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(newAlias),
         groupId: varint(100),
@@ -8381,7 +8691,7 @@ describe('MoqtPlayer', () => {
 
       // "switching" fires up-front so the UI can render a transitional state.
       expect(switchingFn).toHaveBeenCalledTimes(1);
-      expect(switchingFn.mock.calls[0][0]).toMatchObject({
+      expect(switchingFn.mock.calls[0]![0]).toMatchObject({
         type: 'quality_switching',
         fromTrackName: 'video-1',
         toTrackName: 'video-0',
@@ -8471,49 +8781,88 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
-    it('selectVideoTrack() uses AbsoluteStart{startGroup:1n} when currentGroup is 0n', async () => {
+    it('selectVideoTrack() uses legacy LargestObject and joins from group 1 when currentGroup is 0', async () => {
       const adapter = createMockAdapter();
       const player = await loadMultitrack(adapter);
+      const joiningFetch = vi.fn<MoqtConnection['joiningFetch']>(async options => {
+        options.onRequestId?.(999n);
+        return 999n;
+      });
+      adapter.joiningFetch = joiningFetch;
 
-      // Force the no-pipeline-currentGroup path explicitly: stub
-      // videoPipeline to expose currentGroupId === 0n. This skips the
-      // LOC pipeline-creation flow but exercises the exact branch
-      // selectVideoTrack reads.
+      // Keep the original current-group seam; assert the required next-group
+      // floor on the historical request, not on the legacy live filter.
       (player as unknown as { videoPipeline: { currentGroupId: bigint } }).videoPipeline = {
         currentGroupId: 0n,
       };
 
-      await player.selectVideoTrack('video-0');
+      try {
+        expect(adapter.draftVersion).toBe(16);
+        await player.selectVideoTrack('video-0');
+        const opts = lastSubscribeOptions(adapter) as { subscriptionFilter?: { type?: string } } | undefined;
+        expect(opts?.subscriptionFilter).toEqual({ type: 'LargestObject' });
+        expect(joiningFetch).not.toHaveBeenCalled();
 
-      const opts = lastSubscribeOptions(adapter) as {
-        subscriptionFilter?: { type?: string; startGroup?: bigint; startObject?: bigint };
-      } | undefined;
-      expect(opts?.subscriptionFilter?.type).toBe('AbsoluteStart');
-      expect(opts?.subscriptionFilter?.startGroup).toBe(1n);
-      expect(opts?.subscriptionFilter?.startObject).toBe(0n);
+        const targetRequestId = BigInt(await adapter.subscribe.mock.results.at(-1)!.value);
+        const { locationEncodingLength, writeLocation } = await import('@openmoq/transport');
+        const largest = { group: varint(2n), object: varint(1n) };
+        const encoded = new Uint8Array(locationEncodingLength(largest));
+        writeLocation(largest, encoded, 0);
+        adapter._triggerMessage({
+          type: 'SUBSCRIBE_OK', requestId: targetRequestId, trackAlias: varint(88n),
+          parameters: new Map([[0x09n, [encoded]]]),
+        });
 
-      await player.destroy();
+        expect(joiningFetch).toHaveBeenCalledTimes(1);
+        expect(joiningFetch.mock.calls[0]![0]).toMatchObject({
+          joiningFetchType: 'absolute', joiningRequestId: targetRequestId,
+          joiningStart: 1n, groupOrder: 'ascending',
+        });
+      } finally {
+        await player.destroy();
+      }
     });
 
-    it('selectVideoTrack() uses AbsoluteStart{startGroup:N+1} when currentGroup > 0n', async () => {
+    it('selectVideoTrack() uses legacy LargestObject and joins from group 43 when currentGroup is 42', async () => {
       const adapter = createMockAdapter();
       const player = await loadMultitrack(adapter);
+      const joiningFetch = vi.fn<MoqtConnection['joiningFetch']>(async options => {
+        options.onRequestId?.(999n);
+        return 999n;
+      });
+      adapter.joiningFetch = joiningFetch;
 
+      // Keep the original current-group seam; assert the required next-group
+      // floor on the historical request, not on the legacy live filter.
       (player as unknown as { videoPipeline: { currentGroupId: bigint } }).videoPipeline = {
         currentGroupId: 42n,
       };
 
-      await player.selectVideoTrack('video-0');
+      try {
+        expect(adapter.draftVersion).toBe(16);
+        await player.selectVideoTrack('video-0');
+        const opts = lastSubscribeOptions(adapter) as { subscriptionFilter?: { type?: string } } | undefined;
+        expect(opts?.subscriptionFilter).toEqual({ type: 'LargestObject' });
+        expect(joiningFetch).not.toHaveBeenCalled();
 
-      const opts = lastSubscribeOptions(adapter) as {
-        subscriptionFilter?: { type?: string; startGroup?: bigint; startObject?: bigint };
-      } | undefined;
-      expect(opts?.subscriptionFilter?.type).toBe('AbsoluteStart');
-      // Avoid replaying the in-flight group: start at currentGroup + 1.
-      expect(opts?.subscriptionFilter?.startGroup).toBe(43n);
-      expect(opts?.subscriptionFilter?.startObject).toBe(0n);
+        const targetRequestId = BigInt(await adapter.subscribe.mock.results.at(-1)!.value);
+        const { locationEncodingLength, writeLocation } = await import('@openmoq/transport');
+        const largest = { group: varint(44n), object: varint(1n) };
+        const encoded = new Uint8Array(locationEncodingLength(largest));
+        writeLocation(largest, encoded, 0);
+        adapter._triggerMessage({
+          type: 'SUBSCRIBE_OK', requestId: targetRequestId, trackAlias: varint(88n),
+          parameters: new Map([[0x09n, [encoded]]]),
+        });
 
-      await player.destroy();
+        expect(joiningFetch).toHaveBeenCalledTimes(1);
+        expect(joiningFetch.mock.calls[0]![0]).toMatchObject({
+          joiningFetchType: 'absolute', joiningRequestId: targetRequestId,
+          joiningStart: 43n, groupOrder: 'ascending',
+        });
+      } finally {
+        await player.destroy();
+      }
     });
 
     /**
@@ -8571,11 +8920,11 @@ describe('MoqtPlayer', () => {
         onStall: null as ((durationMs: number) => void) | null,
         // changeType always rejects — simulates the browser saying the
         // new codec isn't supported (or any other MSE-level failure).
-        changeType: vi.fn(() => Promise.reject(new Error('mock changeType rejected'))),
+        changeType: vi.fn().mockRejectedValueOnce(new Error('mock changeType rejected')).mockResolvedValue(undefined),
       };
       const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
-        options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void },
+        options: Parameters<NonNullable<MoqtPlayerConfig['createCmafAssembler']>>[0],
       ) => {
         const pending = new Map<string, Uint8Array>();
         return {
@@ -8593,7 +8942,7 @@ describe('MoqtPlayer', () => {
                 const seg = new Uint8Array(moof.byteLength + payload.byteLength);
                 seg.set(moof, 0);
                 seg.set(payload, moof.byteLength);
-                options.onSegment(mediaType, seg, trackName);
+                options.onSegment(mediaType, seg, trackName, groupId);
               }
             }
           },
@@ -8617,7 +8966,7 @@ describe('MoqtPlayer', () => {
       // Deliver the two-codec CMAF catalog
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -8670,7 +9019,7 @@ describe('MoqtPlayer', () => {
       // what triggers completePendingVideoSwitch → changeType (which
       // rejects) → abortPendingVideoSwitch.
       const fakeMoof = new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]); // 'moof'
-      adapter._triggerObject(newAlias, {
+      adapter._triggerObject(newAlias, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(newAlias),
         groupId: varint(1),
@@ -8683,10 +9032,13 @@ describe('MoqtPlayer', () => {
       await new Promise(r => setTimeout(r, 10));
       await new Promise(r => setTimeout(r, 10));
 
-      // changeType was called and rejected; rollback fired.
-      expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+      // A rejected retype can have mutated the source, so restoration is explicit.
+      expect(mockMs.changeType).toHaveBeenCalledTimes(2);
+      expect(mockMs.changeType.mock.calls[1]).toEqual([
+        'video', 'avc1.4D401F', new Uint8Array([0x00, 0x01, 0x02, 0x03]),
+      ]);
       expect(failedFn).toHaveBeenCalledTimes(1);
-      expect(failedFn.mock.calls[0][0]).toMatchObject({
+      expect(failedFn.mock.calls[0]![0]).toMatchObject({
         type: 'quality_switch_failed',
         fromTrackName: 'video_avc',
         toTrackName: 'video_hevc',
@@ -8763,11 +9115,11 @@ describe('MoqtPlayer', () => {
         onError: null as ((error: Error) => void) | null,
         onStall: null as ((durationMs: number) => void) | null,
         // changeType resolves successfully — the happy path.
-        changeType: vi.fn(() => Promise.resolve()),
+        changeType: vi.fn<NonNullable<MediaSourceLike['changeType']>>(() => Promise.resolve()),
       };
       const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
-        options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void },
+        options: Parameters<NonNullable<MoqtPlayerConfig['createCmafAssembler']>>[0],
       ) => {
         const pending = new Map<string, Uint8Array>();
         return {
@@ -8785,7 +9137,7 @@ describe('MoqtPlayer', () => {
                 const seg = new Uint8Array(moof.byteLength + payload.byteLength);
                 seg.set(moof, 0);
                 seg.set(payload, moof.byteLength);
-                options.onSegment(mediaType, seg, trackName);
+                options.onSegment(mediaType, seg, trackName, groupId);
               }
             }
           },
@@ -8809,7 +9161,7 @@ describe('MoqtPlayer', () => {
       // Deliver the two-codec CMAF catalog
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -8845,7 +9197,7 @@ describe('MoqtPlayer', () => {
       // Trigger keyframe (objectId === 0n) → completePendingVideoSwitch
       // → changeType (resolves) → flushCmafStagedBuffer.
       const fakeMoof = new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]); // 'moof'
-      adapter._triggerObject(newAlias, {
+      adapter._triggerObject(newAlias, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(newAlias),
         groupId: varint(1),
@@ -8869,7 +9221,7 @@ describe('MoqtPlayer', () => {
 
       // Commit-time event fired exactly once with the right payload.
       expect(switchedFn).toHaveBeenCalledTimes(1);
-      expect(switchedFn.mock.calls[0][0]).toMatchObject({
+      expect(switchedFn.mock.calls[0]![0]).toMatchObject({
         type: 'quality_switched',
         fromTrackName: 'video_avc',
         toTrackName: 'video_hevc',
@@ -8887,6 +9239,86 @@ describe('MoqtPlayer', () => {
       // private state; the negative assertion is sharp enough — the
       // NEW track must NOT have been unsubscribed (rollback path).
       expect(unsubReqIds).not.toContain(Number(newReqId));
+
+      await player.destroy();
+    });
+
+    /**
+     * The switch splices on the new track's first sync sample, read from
+     * the fragment's own sample flags, not merely on objectId 0: a group
+     * that opens with a delta frame would leave a gap at the playhead.
+     */
+    it('commits a CMAF switch on the first sync sample, not a non-sync object 0', async () => {
+      const init = btoa(String.fromCharCode(...videoInit()));
+      const catalog = JSON.stringify({
+        version: 1,
+        tracks: [
+          { name: 'video_hi', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
+            altGroup: 1, codec: 'avc1.4D401F', width: 1280, height: 720, bitrate: 2_500_000, initData: init },
+          { name: 'video_lo', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
+            altGroup: 1, codec: 'avc1.4D401F', width: 854, height: 480, bitrate: 1_200_000, initData: init },
+        ],
+      });
+      const adapter = createMockAdapter();
+      const mockMs = {
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
+        mediaElement: null,
+        onFirstFrame: null as (() => void) | null,
+        onError: null as ((error: Error) => void) | null,
+        onStall: null as ((durationMs: number) => void) | null,
+      };
+      const pushed: bigint[] = [];
+      const assembler = {
+        push: vi.fn((_mt: 'video' | 'audio', trackName: string, groupId: bigint) => {
+          if (trackName === 'video_lo') pushed.push(groupId);
+        }),
+        selectTrack: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
+      };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter), startLevel: 0,
+        createMediaSource: () => mockMs, createCmafAssembler: () => assembler,
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, { publisherPriority: 128,
+        kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0), payload: new TextEncoder().encode(catalog),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 10));
+
+      const switchedFn = vi.fn();
+      player.on('quality_switched', switchedFn);
+      await player.selectVideoTrack('video_lo');
+      const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;
+      const newAlias = BigInt(newReqId) + 100n;
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(newReqId), trackAlias: varint(newAlias),
+        parameters: new Map(),
+      } as unknown as ControlMessage);
+      const deliver = (groupId: number, objectId: number, flags: number) => {
+        adapter._triggerObject(newAlias, { publisherPriority: 128,
+          kind: 'data', trackAlias: varint(newAlias), groupId: varint(groupId), subgroupId: varint(0),
+          objectId: varint(objectId),
+          payload: buildChunk({ bmdt: 3000 * (groupId * 30 + objectId), samples: [{ duration: 3000, size: 4, flags }] }),
+        } as MoqtObject);
+      };
+
+      // Object 0 of a group that opens on a delta frame: not a splice point.
+      deliver(7, 0, NON_SYNC_FLAGS);
+      deliver(7, 1, NON_SYNC_FLAGS);
+      await new Promise(r => setTimeout(r, 10));
+      expect(switchedFn).not.toHaveBeenCalled();
+      expect(pushed).toEqual([]);
+
+      // The next sync sample commits; the delta frames staged ahead of it
+      // are dropped rather than appended after the new init.
+      deliver(8, 0, SYNC_FLAGS);
+      await new Promise(r => setTimeout(r, 10));
+      expect(switchedFn).toHaveBeenCalledTimes(1);
+      expect(pushed).toEqual([8n]);
 
       await player.destroy();
     });
@@ -8939,7 +9371,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -9006,7 +9438,7 @@ describe('MoqtPlayer', () => {
         onFirstFrame: null as (() => void) | null,
         onError: null as ((error: Error) => void) | null,
         onStall: null as ((durationMs: number) => void) | null,
-        changeType: vi.fn(() => Promise.resolve()),
+        changeType: vi.fn<NonNullable<MediaSourceLike['changeType']>>(() => Promise.resolve()),
       };
       const assembler = {
         push: vi.fn(),
@@ -9027,7 +9459,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -9046,6 +9478,154 @@ describe('MoqtPlayer', () => {
 
       await player.destroy();
     });
+  });
+
+  // ─── CMAF switch: per-track init and retired-track isolation ─────
+
+  describe('CMAF switch re-initializes MSE with the target track init', () => {
+    /**
+     * Each CMAF track carries its own init (track_ID, sample entry, trex),
+     * so a rendition switch must append the target's init even when the
+     * codec string is unchanged, and no retired-track segment may reach
+     * MSE once that re-init starts.
+     */
+    const moof = new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]);
+    const mdat = new Uint8Array([0, 0, 0, 8, 0x6d, 0x64, 0x61, 0x74]);
+
+    async function setup(
+      targetCodec: string,
+      changeType: () => Promise<void>,
+    ) {
+      const catalog = JSON.stringify({
+        version: 1,
+        tracks: [
+          {
+            name: 'video_720', packaging: 'cmaf', isLive: true, role: 'video',
+            renderGroup: 1, altGroup: 1, codec: 'avc1.4D401F', width: 1280, height: 720,
+            bitrate: 2_500_000, initData: btoa(String.fromCharCode(0x00, 0x01, 0x02, 0x03)),
+          },
+          {
+            name: 'video_480', packaging: 'cmaf', isLive: true, role: 'video',
+            renderGroup: 1, altGroup: 1, codec: targetCodec, width: 854, height: 480,
+            bitrate: 1_200_000, initData: btoa(String.fromCharCode(0x10, 0x11, 0x12, 0x13)),
+          },
+        ],
+      });
+      const adapter = createMockAdapter();
+      const mockMs = {
+        initialize: vi.fn(),
+        appendChunk: vi.fn(),
+        endOfStream: vi.fn(),
+        reset: vi.fn(),
+        destroy: vi.fn(),
+        mediaElement: null,
+        onFirstFrame: null as (() => void) | null,
+        onError: null as ((error: Error) => void) | null,
+        onStall: null as ((durationMs: number) => void) | null,
+        changeType: vi.fn(changeType),
+      };
+      const pushed: Array<{ trackName: string; groupId: bigint }> = [];
+      const assembler = {
+        push: vi.fn((_mt: 'video' | 'audio', trackName: string, groupId: bigint) => {
+          pushed.push({ trackName, groupId });
+        }),
+        selectTrack: vi.fn(),
+        getEpoch: () => null,
+        reset: vi.fn(),
+        destroy: vi.fn(),
+      };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        startLevel: 0,
+        createMediaSource: () => mockMs,
+        createCmafAssembler: () => assembler,
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, { publisherPriority: 128,
+        kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0), payload: new TextEncoder().encode(catalog),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 10));
+      await ackMedia(adapter);
+      const oldAlias = BigInt(await (adapter.subscribe as any).mock.results[1]!.value);
+
+      const deliver = (alias: bigint, groupId: number, objectId: number, payload: Uint8Array) => {
+        adapter._triggerObject(alias, { publisherPriority: 128,
+          kind: 'data', trackAlias: varint(alias), groupId: varint(groupId),
+          subgroupId: varint(0), objectId: varint(objectId), payload,
+        } as MoqtObject);
+      };
+
+      await player.selectVideoTrack('video_480');
+      const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;
+      const newAlias = BigInt(newReqId) + 100n;
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(newReqId), trackAlias: varint(newAlias),
+        parameters: new Map(),
+      } as unknown as ControlMessage);
+      return { player, mockMs, assembler, pushed, deliver, oldAlias, newAlias };
+    }
+
+    it('same-codec switch appends the target init before its media', async () => {
+      const { player, mockMs, pushed, deliver, newAlias } = await setup(
+        'avc1.4D401F', () => Promise.resolve());
+      const switchedFn = vi.fn();
+      player.on('quality_switched', switchedFn);
+
+      deliver(newAlias, 5, 0, moof);
+      await new Promise(r => setTimeout(r, 10));
+
+      expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+      const [mt, codec, init] = mockMs.changeType.mock.calls[0]! as unknown as [string, string, Uint8Array];
+      expect(mt).toBe('video');
+      expect(codec).toBe('avc1.4D401F');
+      expect(Array.from(init)).toEqual([0x10, 0x11, 0x12, 0x13]);
+      // Staged new-track media reached the assembler only after the re-init.
+      expect(pushed).toEqual([{ trackName: 'video_480', groupId: 5n }]);
+      expect(switchedFn).toHaveBeenCalledTimes(1);
+
+      await player.destroy();
+    });
+
+    it('drops retired-track segments that arrive while the re-init is in flight', async () => {
+      let finish!: () => void;
+      const { player, pushed, deliver, oldAlias, newAlias } = await setup(
+        'avc1.4D401E', () => new Promise<void>(r => { finish = r; }));
+
+      // Old track plays until the switch commits.
+      deliver(oldAlias, 4, 0, moof);
+      deliver(oldAlias, 4, 0, mdat);
+      expect(pushed.filter(p => p.trackName === 'video_720')).toHaveLength(2);
+
+      // New keyframe starts the commit; the old track's next group lands
+      // while changeType is still pending.
+      deliver(newAlias, 5, 0, moof);
+      deliver(oldAlias, 5, 0, moof);
+      deliver(oldAlias, 5, 0, mdat);
+      expect(pushed.filter(p => p.trackName === 'video_720')).toHaveLength(2);
+
+      finish();
+      await new Promise(r => setTimeout(r, 10));
+      expect(pushed.at(-1)).toEqual({ trackName: 'video_480', groupId: 5n });
+      expect(pushed.filter(p => p.trackName === 'video_720')).toHaveLength(2);
+
+      await player.destroy();
+    });
+    it('keeps the committed assembler target when a quality observer throws', async () => {
+      const { player, assembler, deliver, newAlias } = await setup('avc1.4D401F', () => Promise.resolve());
+      try {
+        player.on('quality_switched', () => { throw new Error('quality observer failed'); });
+        deliver(newAlias, 5, 0, moof);
+        await new Promise(resolve => setTimeout(resolve, 10));
+        expect(assembler.selectTrack).toHaveBeenLastCalledWith('video', 'video_480');
+        expect(player.stats.qualitySwitchCount).toBe(1);
+      } finally { await player.destroy(); }
+    });
+
   });
 
   // ─── External Adapter Mode ────────────────────────────────────────
@@ -9259,7 +9839,7 @@ describe('MoqtPlayer', () => {
 
       const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: catalogReqId,
         groupId: varint(0),
@@ -9295,7 +9875,7 @@ describe('MoqtPlayer', () => {
       function feedGroups(count: number, startGroup = 0) {
         for (let g = startGroup; g < startGroup + count; g++) {
           advanceClock(1_000_000);
-          adapter._triggerObject(BigInt(g + 1), {
+          adapter._triggerObject(BigInt(g + 1), { publisherPriority: 128,
             kind: 'data', trackAlias: videoAlias,
             groupId: varint(g), subgroupId: varint(0), objectId: varint(0),
             payload: new Uint8Array(payloadSize), extensions: new Uint8Array(0),
@@ -9321,6 +9901,8 @@ describe('MoqtPlayer', () => {
         );
       }
 
+      player.play();
+      expect(player.state).toBe(PlayerState.PLAYING);
       return { adapter, renderer, decoder, player, feedGroups, simulateRenderedFrames, hasSubscribeTo };
     }
 
@@ -9331,10 +9913,24 @@ describe('MoqtPlayer', () => {
       simulateRenderedFrames(10);
       const subsBefore = (adapter.subscribe as any).mock.calls.length;
 
-      advanceClock(16_000_000);
+      feedGroups(16, 8);
       player.tick();
 
       expect(hasSubscribeTo('video-0', subsBefore)).toBe(true);
+      await player.destroy();
+    });
+
+    it('LOC: does not upshift from an estimate retained across an unobserved gap', async () => {
+      const { player, feedGroups, simulateRenderedFrames, hasSubscribeTo, adapter } = await setupAbrTest();
+
+      feedGroups(8);
+      simulateRenderedFrames(10);
+      const subsBefore = vi.mocked(adapter.subscribe).mock.calls.length;
+
+      advanceClock(16_000_000);
+      player.tick();
+
+      expect(hasSubscribeTo('video-0', subsBefore)).toBe(false);
       await player.destroy();
     });
 
@@ -9604,7 +10200,7 @@ describe('MoqtPlayer', () => {
       } as any);
 
       // Feed group 5 so the pipeline has a known currentGroupId
-      adapter._triggerObject(5n, {
+      adapter._triggerObject(5n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: videoAlias,
         groupId: varint(5),
@@ -9623,9 +10219,8 @@ describe('MoqtPlayer', () => {
       // This should be rejected by the pipeline
       const objectsFn = vi.fn();
       player.on('media_object', objectsFn);
-      const objectsBefore = objectsFn.mock.calls.length;
 
-      adapter._triggerObject(5n, {
+      adapter._triggerObject(5n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: videoAlias,
         groupId: varint(5),
@@ -9658,7 +10253,7 @@ describe('MoqtPlayer', () => {
 
       // Deliver catalog
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -9706,7 +10301,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -9754,7 +10349,7 @@ describe('MoqtPlayer', () => {
       await resolveConnect(adapter);
       await loadPromise;
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
         payload: new TextEncoder().encode(CATALOG_JSON),
       } as MoqtObject);
@@ -9860,7 +10455,7 @@ describe('MoqtPlayer', () => {
         createConnection: () => adapter as unknown as MoqtConnection,
         catalogBootstrap: 'subscribe',
         createMediaSource: () => ms as any,
-        createCmafAssembler: (opts: any) => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() }),
+        createCmafAssembler: () => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn(), reset: vi.fn(), getEpoch: () => null }),
         qualitySwitchCooldownMs: 1,
       });
 
@@ -9869,7 +10464,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -9892,7 +10487,7 @@ describe('MoqtPlayer', () => {
 
     it('downshifts when CMAF buffer is starved (getBufferAheadUs returns 0)', async () => {
       const adapter = createMockAdapter();
-      const ms = createMockMediaSource(0); // 0 = starvation
+      const ms = { ...createMockMediaSource(0), setPlaybackIntent: vi.fn() }; // 0 = starvation
       const player = new MoqtPlayer({
         url: 'https://relay.example.com/moq',
         namespace: 'live/broadcast',
@@ -9900,7 +10495,7 @@ describe('MoqtPlayer', () => {
         createConnection: () => adapter as unknown as MoqtConnection,
         catalogBootstrap: 'subscribe',
         createMediaSource: () => ms as any,
-        createCmafAssembler: (opts: any) => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() }),
+        createCmafAssembler: () => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn(), reset: vi.fn(), getEpoch: () => null }),
         qualitySwitchCooldownMs: 1,
       });
 
@@ -9909,7 +10504,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -9920,6 +10515,10 @@ describe('MoqtPlayer', () => {
       await new Promise(r => setTimeout(r, 0));
 
       const subsBeforeTicks = (adapter.subscribe as any).mock.calls.length;
+
+      player.play();
+      expect(player.state).toBe('playing');
+      expect(ms.setPlaybackIntent).toHaveBeenCalledExactlyOnceWith(true);
 
       // Tick to trigger ABR evaluation
       for (let i = 0; i < 5; i++) player.tick();
@@ -9946,7 +10545,7 @@ describe('MoqtPlayer', () => {
         createConnection: () => adapter as unknown as MoqtConnection,
         catalogBootstrap: 'subscribe',
         createMediaSource: () => ms as any,
-        createCmafAssembler: (opts: any) => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() }),
+        createCmafAssembler: () => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn(), reset: vi.fn(), getEpoch: () => null }),
         qualitySwitchCooldownMs: 1,
       });
 
@@ -9955,7 +10554,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -10018,7 +10617,7 @@ describe('MoqtPlayer', () => {
         createConnection: () => adapter as unknown as MoqtConnection,
         catalogBootstrap: 'subscribe',
         createMediaSource: () => ms as any,
-        createCmafAssembler: (opts: any) => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() }),
+        createCmafAssembler: () => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn(), reset: vi.fn(), getEpoch: () => null }),
         qualitySwitchCooldownMs: 1,
       });
 
@@ -10027,7 +10626,7 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       ackCatalog(adapter);
-      adapter._triggerObject(0n, {
+      adapter._triggerObject(0n, { publisherPriority: 128,
         kind: 'data',
         trackAlias: varint(1),
         groupId: varint(0),
@@ -10153,7 +10752,7 @@ describe('MSE playhead-wedge escalation', () => {
     await resolveConnect(adapter);
     await loadPromise;
     ackCatalog(adapter);
-    adapter._triggerObject(0n, {
+    adapter._triggerObject(0n, { publisherPriority: 128,
       kind: 'data', trackAlias: varint(1),
       groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
       payload: new TextEncoder().encode(CMAF_INLINE_CATALOG),
@@ -10264,6 +10863,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await migratePromise;
 
     expect(managerDraft(player)).toBe(18);
@@ -10272,7 +10874,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
   const TS = 1_726_000_000_000_000n; // realistic epoch-µs, diverges under vi64 vs QUIC
 
-  const locObject = (alias: bigint, streamId: bigint, wireProfile: 'd16-delta-varint' | 'd18-delta-vi64'): MoqtObject => ({
+  const locObject = (alias: bigint, _streamId: bigint, wireProfile: 'd16-delta-varint' | 'd18-delta-vi64'): MoqtObject => ({ publisherPriority: 128,
     kind: 'data',
     trackAlias: varint(alias),
     groupId: varint(1),
@@ -10303,9 +10905,14 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await resolveConnect(a1);
     await loadPromise;
 
-    // Observe the DECODED headers the manager produces.
+    // Observe the DECODED headers the manager produces. The subscription is
+    // registered the way the session owns it — a manager entry alone is a
+    // route no session claims, and the player routes per SOURCE connection so
+    // that it cannot deliver through another session's track.
     const mgr = mgrOf(player);
     mgr.registerTrack(77n, 'video', 'video');
+    (player as unknown as { activeSubscriptions: Map<bigint, { trackAlias: bigint; trackName: string; mediaType: string }> })
+      .activeSubscriptions.set(1177n, { trackAlias: 77n, trackName: 'video', mediaType: 'video' });
     let decoded: { captureTimestamp?: bigint } | undefined;
     mgr.onObject = (_mt, _tn, _obj, headers) => { decoded = headers; };
 
@@ -10314,6 +10921,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
     expect(managerDraft(player)).toBe(18);      // shared manager already migrated
     expect(releaseClose).not.toBeNull();        // migrate is parked on the close
@@ -10374,6 +10984,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await migratePromise;
 
     const mgr = mgrOf(player);
@@ -10402,9 +11015,18 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await migratePromise;
 
-    // The NEW session (a2, now current) buffers an object for an unresolved alias.
+    // The NEW session (a2, now current) buffers an object for an unresolved
+    // alias. Parking only happens while some request on that session is still
+    // awaiting its SUBSCRIBE_OK — with none outstanding nothing could ever
+    // bind the alias, so the data is dropped rather than retained for a future
+    // unrelated request. The adopted session's own requests are all answered
+    // by now, so this stands in for one that is not.
+    (player as unknown as { pendingAliasBinds: Set<bigint> }).pendingAliasBinds.add(4242n);
     a2._triggerObject(7n, locObject(88n, 7n, 'd18-delta-vi64'));
 
     const mgr = mgrOf(player);
@@ -10447,11 +11069,14 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
     (a2.unsubscribe as ReturnType<typeof vi.fn>).mockClear();
 
     // The OLD session delivers a MALFORMED object during the overlap.
-    a1._triggerObject(9n, {
+    a1._triggerObject(9n, { publisherPriority: 128,
       kind: 'data',
       trackAlias: varint(55n),
       groupId: varint(1),
@@ -10481,7 +11106,17 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     const a2 = createMockAdapter();
     a2.draftVersion = 18;
     let firedDuringSubscribe = false;
-    a2.subscribe = vi.fn(async () => {
+    let nextMediaId = 8n;
+    a2.subscribe = vi.fn<MoqtConnection['subscribe']>(async (...args: unknown[]) => {
+      const name = new TextDecoder().decode(args[1] as Uint8Array);
+      const options = args[2] as { onRequestId?: (id: bigint) => void } | undefined;
+      if (name !== 'catalog') {
+        const id = nextMediaId;
+        nextMediaId += 2n;
+        options?.onRequestId?.(id);
+        return varint(id);
+      }
+      options?.onRequestId?.(7n);
       // Fast peer: the catalog SUBSCRIBE_OK (reqId 7 → alias 50) arrives DURING
       // subscribe(), before it resolves — must be staged, not dropped by the guard.
       a2.onMessage?.({
@@ -10489,7 +11124,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
       } as unknown as ControlMessage);
       // A stray media object for a different alias — must be staged and buffered
       // under the NEW session, not routed through old-session state.
-      a2.onObject?.(9n, {
+      a2.onObject?.(9n, { publisherPriority: 128,
         kind: 'data', trackAlias: varint(88n),
         groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
         extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
@@ -10500,11 +11135,27 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    await vi.waitFor(() => expect(firedDuringSubscribe).toBe(true));
+    a2._triggerObject(0n, { publisherPriority: 128,
+      kind: 'data', trackAlias: varint(50n), groupId: varint(0),
+      subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    for (const name of ['video', 'audio']) {
+      let index = -1;
+      await vi.waitFor(() => {
+        index = (a2.subscribe as any).mock.calls.findIndex((call: unknown[]) =>
+          new TextDecoder().decode(call[1] as Uint8Array) === name);
+        expect(index).toBeGreaterThanOrEqual(0);
+      });
+      const id = BigInt(await a2.subscribe.mock.results[index]!.value);
+      a2._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(id), parameters: new Map() } as ControlMessage);
+    }
     await migratePromise;
 
     expect(firedDuringSubscribe).toBe(true);
     // The staged SUBSCRIBE_OK was drained after commit → catalog alias resolved.
-    expect((player as unknown as { catalogTrackAlias: bigint | null }).catalogTrackAlias).toBe(50n);
+    expect((player as unknown as { catalogSlots: { catalogTrackAlias: bigint | null } }).catalogSlots.catalogTrackAlias).toBe(50n);
     // The staged object was drained under the NEW session — where no request
     // is outstanding for it, so per request/generation ownership it is
     // DROPPED (unownable), never routed through old-session state.
@@ -10528,6 +11179,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
 
     // The handoff already committed — an old-session close failure is non-fatal.
     await expect(migratePromise).resolves.toBeUndefined();
@@ -10558,7 +11212,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
       } as unknown as ControlMessage);
     });
 
-    await player.migrate(a2 as unknown as MoqtConnection);
+    const wiring = player.migrate(a2 as unknown as MoqtConnection);
+    await acceptReplacement(a2);
+    await wiring;
     expect(handlersAtConnect).toBe(true);
     await player.destroy();
   });
@@ -10574,7 +11230,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     const a2 = createMockAdapter();
     a2.draftVersion = 18;
     a2.connect = vi.fn(async () => { /* candidate connects */ });
-    a2.subscribe = vi.fn(async () => { throw new Error('catalog subscribe refused'); });
+    a2.subscribe = vi.fn<MoqtConnection['subscribe']>(async () => { throw new Error('catalog subscribe refused'); });
     a2.close = vi.fn(async () => { /* candidate discarded */ });
 
     await expect(player.migrate(a2 as unknown as MoqtConnection)).rejects.toThrow('catalog subscribe refused');
@@ -10583,13 +11239,13 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     expect((player as unknown as { connection: unknown }).connection).toBe(a1);
     expect(a2.close).toHaveBeenCalled();
     // And the old session still processes its control messages.
-    const internal = player as unknown as { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null };
-    internal.catalogRequestId = 3n;
-    internal.catalogTrackAlias = null;
+    const internal = player as unknown as { catalogSlots: { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null } };
+    internal.catalogSlots.catalogRequestId = 3n;
+    internal.catalogSlots.catalogTrackAlias = null;
     a1._triggerMessage({
       type: 'SUBSCRIBE_OK', requestId: varint(3n), trackAlias: varint(9n), parameters: new Map(),
     } as unknown as ControlMessage);
-    expect(internal.catalogTrackAlias).toBe(9n);
+    expect(internal.catalogSlots.catalogTrackAlias).toBe(9n);
     await player.destroy();
   });
 
@@ -10604,7 +11260,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     const a2 = createMockAdapter();
     a2.draftVersion = 18;
     a2.connect = vi.fn(async () => { /* candidate connects */ });
-    a2.subscribe = vi.fn(async () => { throw new Error('goaway catalog refused'); });
+    a2.subscribe = vi.fn<MoqtConnection['subscribe']>(async () => { throw new Error('goaway catalog refused'); });
     a2.close = vi.fn(async () => { /* candidate discarded */ });
 
     await expect(
@@ -10635,13 +11291,13 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // The old session was never superseded — it is still current and still
     // processes its control messages.
     expect((player as unknown as { connection: unknown }).connection).toBe(a1);
-    const internal = player as unknown as { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null };
-    internal.catalogRequestId = 7n;
-    internal.catalogTrackAlias = null;
+    const internal = player as unknown as { catalogSlots: { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null } };
+    internal.catalogSlots.catalogRequestId = 7n;
+    internal.catalogSlots.catalogTrackAlias = null;
     a1._triggerMessage({
       type: 'SUBSCRIBE_OK', requestId: varint(7n), trackAlias: varint(55n), parameters: new Map(),
     } as unknown as ControlMessage);
-    expect(internal.catalogTrackAlias).toBe(55n); // old session STILL authoritative
+    expect(internal.catalogSlots.catalogTrackAlias).toBe(55n); // old session STILL authoritative
     await player.destroy();
   });
 
@@ -10667,6 +11323,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
 
     // The OLD relay drops REMOTELY during the overlap (fires onClose + onError).
@@ -10696,13 +11355,16 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await migratePromise;
 
     // Arrange current state so a MATCHING SUBSCRIBE_OK would resolve the catalog
     // alias — making the mutation observable if the stale message were processed.
-    const internal = player as unknown as { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null };
-    internal.catalogRequestId = 42n;
-    internal.catalogTrackAlias = null;
+    const internal = player as unknown as { catalogSlots: { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null } };
+    internal.catalogSlots.catalogRequestId = 42n;
+    internal.catalogSlots.catalogTrackAlias = null;
 
     // A DELAYED old-session (a1) SUBSCRIBE_OK for that requestId arrives.
     a1._triggerMessage({
@@ -10710,7 +11372,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     } as unknown as ControlMessage);
 
     // The superseded session must not set the current catalog alias.
-    expect(internal.catalogTrackAlias).toBeNull();
+    expect(internal.catalogSlots.catalogTrackAlias).toBeNull();
     await player.destroy();
   });
 
@@ -10734,6 +11396,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     expect(a1.close).not.toHaveBeenCalled();
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await migratePromise;
 
     expect(a1.close).toHaveBeenCalled();
@@ -10776,7 +11441,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a1._triggerMessage({
       type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n), parameters: new Map(),
     } as unknown as ControlMessage);
-    a1._triggerObject(1n, {
+    a1._triggerObject(1n, { publisherPriority: 128,
       kind: 'data', trackAlias: varint(1n), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new TextEncoder().encode(CATALOG_JSON),
     } as MoqtObject);
@@ -10788,7 +11453,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // Emit one object per unique unknown alias, past the cap. Bare extensions —
     // buffered objects are not decoded until replay.
     for (let i = 0; i < CAP + 50; i++) {
-      a1._triggerObject(BigInt(i), {
+      a1._triggerObject(BigInt(i), { publisherPriority: 128,
         kind: 'data', trackAlias: varint(BigInt(100000 + i)),
         groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
         extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
@@ -10802,8 +11467,60 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
   const holdSubscribe = (a: ReturnType<typeof createMockAdapter>): { release: (r: bigint) => void } => {
     const box: { release: (r: bigint) => void } = { release: () => {} };
-    a.subscribe = vi.fn(() => new Promise((resolve) => { box.release = (r) => resolve(varint(r)); }));
+    a.subscribe = vi.fn<MoqtConnection['subscribe']>(() => new Promise((resolve) => { box.release = (r) => resolve(varint(r)); }));
     return box;
+  };
+
+  /** Let the awaited continuation of a released subscribe register its request. */
+  const settleRegistration = async (): Promise<void> => {
+    for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  };
+
+  /**
+   * Carry a HELD replacement all the way to adoptable.
+   *
+   * `holdSubscribe` parks each request the candidate sends, which used to be
+   * the whole of establishment: releasing the catalog subscribe was enough,
+   * because the old session was retired as soon as that request had been sent.
+   * Graceful handover waits for the replacement to be USABLE, so every held
+   * request now has to be released AND answered: the catalog accepted and
+   * delivered, then each required media track accepted. Ids are assigned from
+   * `firstReqId` upward in the order the candidate asks.
+   */
+  const completeHeldReplacement = async (
+    adapter: ReturnType<typeof createMockAdapter>,
+    held: { release: (r: bigint) => void },
+    firstReqId: bigint,
+  ): Promise<void> => {
+    const calls = (): number => (adapter.subscribe as any).mock.calls.length;
+    const accept = (id: bigint): void => {
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(id), parameters: new Map(),
+      } as unknown as ControlMessage);
+    };
+    let nextId = firstReqId;
+    const issued = calls();
+    held.release(nextId);
+    await settleRegistration();
+    accept(nextId);
+    adapter._triggerObject(0n, { publisherPriority: 128,
+      kind: 'data',
+      trackAlias: varint(nextId),
+      groupId: varint(0),
+      subgroupId: varint(0),
+      objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    // CATALOG_JSON selects one video and one audio track; each is requested in
+    // turn, so each is released only once the candidate has asked for it.
+    for (let i = 0; i < 2; i += 1) {
+      nextId += 1n;
+      await vi.waitFor(() => expect(calls()).toBeGreaterThan(issued + i));
+      held.release(nextId);
+      await settleRegistration();
+      accept(nextId);
+    }
+    await settleRegistration();
   };
 
   it('lifecycle-1: destroy() during an in-flight migration cancels the candidate (no resurrection)', async () => {
@@ -10853,7 +11570,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     expect(a3.connect).not.toHaveBeenCalled();
 
     // The first migration still completes normally.
-    sub.release(9n);
+    await completeHeldReplacement(a2, sub, 9n);
     await m1;
     expect((player as unknown as { connection: unknown }).connection).toBe(a2);
     await player.destroy();
@@ -10906,7 +11623,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // The over-cap event trips the overflow guard, which detaches + closes the
     // candidate (so the remaining sends become no-ops).
     for (let i = 0; i < 600; i++) { // > MAX_STAGED_EVENTS (512)
-      a2.onObject?.(BigInt(i), {
+      a2.onObject?.(BigInt(i), { publisherPriority: 128,
         kind: 'data', trackAlias: varint(BigInt(5000 + i)),
         groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
         extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
@@ -10943,7 +11660,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     player.on('session_error', errorFn);
 
     // GOAWAY → automatic migration to a2, whose connect() rejects.
-    a1._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://new-relay.example.com/moq' } as unknown as ControlMessage);
+    a1._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
     await vi.waitFor(() => expect(a2.connect).toHaveBeenCalled());
     await vi.waitFor(() => expect(errorFn).toHaveBeenCalled()); // surfaced, not an unhandled rejection
 
@@ -10975,9 +11692,11 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // Stage an object that will route on drain, and make routing THROW.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
-    a2.onObject?.(9n, {
-      kind: 'data', trackAlias: varint(88n),
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
+    a2.onObject?.(9n, { publisherPriority: 128,
+      kind: 'data', trackAlias: varint(8n),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
@@ -10986,7 +11705,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // Commit + drain: the staged event throws but is isolated per-event — the
     // now-authoritative session must NOT be rolled back, AND the failure must be
     // surfaced (not silently swallowed).
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await expect(m).resolves.toBeUndefined();
     expect((player as unknown as { connection: unknown }).connection).toBe(a2);
     expect(errorFn).toHaveBeenCalled(); // replay failure routed through the error channel
@@ -11005,7 +11724,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     a2.close = vi.fn(async () => {});
     let rejectSub: (e: Error) => void = () => {};
-    a2.subscribe = vi.fn(() => new Promise((_res, rej) => { rejectSub = rej; }));
+    a2.subscribe = vi.fn<MoqtConnection['subscribe']>(() => new Promise((_res, rej) => { rejectSub = rej; }));
 
     const m = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
@@ -11019,10 +11738,12 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // Invoking the SAVED (pre-detach) callback must be inert — never route live.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
     const routeSpy = vi.spyOn(mgr, 'routeObject');
-    savedOnObject?.(9n, {
-      kind: 'data', trackAlias: varint(88n),
+    savedOnObject?.(9n, { publisherPriority: 128,
+      kind: 'data', trackAlias: varint(8n),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
@@ -11032,7 +11753,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
   });
 
   it('a concurrent migration is rejected before creating a transport', async () => {
-    const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
+    const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({}) as unknown as WebTransport);
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer({
@@ -11058,7 +11779,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     expect(createTransport.mock.calls.length).toBe(callsBefore); // no orphaned transport
     expect(a3.connect).not.toHaveBeenCalled();
 
-    sub.release(9n);
+    await completeHeldReplacement(a2, sub, 9n);
     await m1;
     await player.destroy();
   });
@@ -11087,7 +11808,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2._triggerError(new MoqtConnectionError('subgroup reset during establishment', { errorSource: 'data' }));
     expect(errorFn).not.toHaveBeenCalled(); // deferred, not emitted during establishment
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await expect(m).resolves.toBeUndefined();
     expect((player as unknown as { connection: unknown }).connection).toBe(a2);
     expect(errorFn).toHaveBeenCalled(); // the staged diagnostic emits AFTER commit
@@ -11116,7 +11837,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     let sent = 0;
     for (let i = 0; i < 512; i++) {
       if (!a2.onObject) break; // detached once staging overflows
-      a2.onObject(BigInt(i), {
+      a2.onObject(BigInt(i), { publisherPriority: 128,
         kind: 'data', trackAlias: varint(BigInt(7000 + i)),
         groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
         extensions: new Uint8Array(0), payload: bigPayload,
@@ -11133,7 +11854,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('control-message parameter bytes count toward the byte limit below the event cap', async () => {
+  it('dispatches a candidate\'s control messages instead of charging them to the buffer', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -11149,11 +11870,14 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await resolveConnect(a2);
     await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
 
-    // Control messages retaining large parameter byte arrays (no payload at all —
-    // this is what the old flat 1 KiB charge missed): 4 × 64 KiB = 256 KiB each,
-    // so the 8 MiB cap trips after ~32 messages, far below the 512-event cap.
-    // DISTINCT buffers per parameter so the accounting reflects REAL retention,
-    // not a single shared buffer counted many times.
+    // Control messages are no longer RETAINED for a candidate: they are its
+    // readiness evidence — the acceptances and refusals the handover is
+    // waiting on — so they are dispatched against candidate-owned state as
+    // they arrive, and buffering them would make the attempt wait for answers
+    // it had already been given. Nothing is retained, so no amount of them
+    // trips the retained-byte cap, and the candidate stays alive. The cap
+    // still protects against candidate DATA, which is what the byte-limit and
+    // event-cap cases above exercise.
     let sent = 0;
     for (let i = 0; i < 512; i++) {
       if (!a2.onMessage) break; // detached once staging overflows
@@ -11164,14 +11888,18 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
       } as unknown as ControlMessage);
       sent++;
     }
-    expect(sent).toBeGreaterThan(0);
-    expect(sent).toBeLessThan(200); // byte cap from parameters, NOT the 512 event cap
-    expect(a2.close).toHaveBeenCalled();
+    expect(sent).toBe(512);                  // every one dispatched, none retained
+    expect(a2.close).not.toHaveBeenCalled(); // so nothing overflowed the buffer
 
-    sub.release(7n);
-    await expect(m).rejects.toThrow();
+    // None of them answered the candidate's catalog request, so the attempt is
+    // still unfinished and the old session is still the current one.
     expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    sub.release(7n);
+    // Releasing the request is not an answer to it: nothing accepted the
+    // catalog, so the attempt only ends when it is abandoned. Destroy does
+    // that here rather than waiting out its deadline.
     await player.destroy();
+    await expect(m).rejects.toThrow();
   });
 
   it('a reentrant close during drain terminates without a spurious candidate abort', async () => {
@@ -11199,18 +11927,20 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // must not re-buffer for the closed connection), and migration must NOT be
     // reported successful.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
-    const obj = (alias: bigint): MoqtObject => ({
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
+    const obj = (alias: bigint): MoqtObject => ({ publisherPriority: 128,
       kind: 'data', trackAlias: varint(alias),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
-    a2.onObject?.(9n, obj(88n));
+    a2.onObject?.(9n, obj(8n));
     a2.onObject?.(10n, obj(999n)); // unknown alias — would re-buffer if drain continued
     let routeCalls = 0;
     vi.spyOn(mgr, 'routeObject').mockImplementation(() => { routeCalls++; a2._triggerClose(0x1, 'reentrant during drain'); });
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     // The committed session died during handoff → migration is NOT reported success.
     await expect(m).rejects.toThrow(/session closed during handoff/);
     expect(migrated).not.toHaveBeenCalled();
@@ -11242,9 +11972,11 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // A staged event throws on replay; the error listener ALSO throws.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
-    a2.onObject?.(9n, {
-      kind: 'data', trackAlias: varint(88n),
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
+    a2.onObject?.(9n, { publisherPriority: 128,
+      kind: 'data', trackAlias: varint(8n),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
@@ -11253,7 +11985,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // Neither exception may escape: migration completes and the transaction lock
     // is released, so a subsequent migration is not permanently blocked.
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await expect(m).resolves.toBeUndefined();
     expect((player as unknown as { currentMigration: unknown }).currentMigration).toBeNull();
 
@@ -11261,6 +11993,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a3.draftVersion = 18;
     const m3 = player.migrate(a3 as unknown as MoqtConnection); // not locked out
     await resolveConnect(a3);
+    await acceptReplacement(a3);
     await m3;
     expect((player as unknown as { connection: unknown }).connection).toBe(a3);
     await player.destroy();
@@ -11288,15 +12021,17 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // A staged OBJECT (data source) whose replay throws → data-source code, not a
     // generic CONNECTION_LOST.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
-    a2.onObject?.(9n, {
-      kind: 'data', trackAlias: varint(88n),
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
+    a2.onObject?.(9n, { publisherPriority: 128,
+      kind: 'data', trackAlias: varint(8n),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
     vi.spyOn(mgr, 'routeObject').mockImplementation(() => { throw new Error('data replay boom'); });
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await expect(m).resolves.toBeUndefined();
     expect(errors.some((e) => e.code === PlayerErrorCode.DATA_STREAM_RESET)).toBe(true);
     await player.destroy();
@@ -11317,7 +12052,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.close = vi.fn(async () => {});
     const m = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
-    // subscribe resolves → commit → drain → retire, which parks on the held a1.close.
+    // The replacement becomes usable → commit → drain → retire, which parks on
+    // the held a1.close.
+    await acceptReplacement(a2);
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
 
     const migrated = vi.fn();
@@ -11360,9 +12097,11 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // Staged event throws on replay; the error listener ALSO throws (emitError
     // throws), so drain falls to log.warn — whose custom logger ALSO throws.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
-    a2.onObject?.(9n, {
-      kind: 'data', trackAlias: varint(88n),
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
+    a2.onObject?.(9n, { publisherPriority: 128,
+      kind: 'data', trackAlias: varint(8n),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
@@ -11370,7 +12109,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     player.on('session_error', () => { throw new Error('listener boom'); });
 
     // No exception (from the callback, the error listener, or the logger) escapes.
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await expect(m).resolves.toBeUndefined();
     expect((player as unknown as { connection: unknown }).connection).toBe(a2);
     await player.destroy();
@@ -11381,7 +12120,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a1.draftVersion = 16;
     const a3 = createMockAdapter();
     a3.draftVersion = 18;
-    const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
+    const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({}) as unknown as WebTransport);
     let cc = 0;
     const createConnection = vi.fn(() => (cc++ === 0 ? a1 : a3) as unknown as MoqtConnection);
     const player = new MoqtPlayer({
@@ -11401,14 +12140,55 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // A GOAWAY arrives on the candidate DURING establishment → staged as a control
     // message, replayed during drain (when the slot is still held).
-    a2._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://goaway-target.example.com/moq' } as unknown as ControlMessage);
+    a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await m; // first handoff completes → processes the queued GOAWAY
 
     await resolveConnect(a3);
+    // The second replacement must be usable too before it is adopted.
+    await acceptReplacement(a3);
     await vi.waitFor(() => expect((player as unknown as { connection: unknown }).connection).toBe(a3));
     expect(createTransport.mock.calls.some((c) => String(c[0]).includes('goaway-target'))).toBe(true);
+    await player.destroy();
+  });
+
+  it('staging a GOAWAY notice charges the notice only, never the connection', async () => {
+    // The notice callback also receives the connection. Charging the whole
+    // argument list would walk the adapter's own state — traversing its getters
+    // and billing unrelated session state against the staged-event budget.
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({}) as unknown as WebTransport);
+    const createConnection = vi.fn(() => a1 as unknown as MoqtConnection);
+    const player = new MoqtPlayer({
+      url: 'https://relay.example.com/moq', namespace: 'live/broadcast', createTransport, createConnection,
+    } as MoqtPlayerConfig);
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    // A tripwire the cost accounting must never read.
+    let getterReads = 0;
+    Object.defineProperty(a2, 'tripwire', {
+      enumerable: true,
+      get() { getterReads++; return 'x'.repeat(1_000_000); },
+    });
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // Staged while the candidate is uncommitted — the path that computes cost.
+    a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
+    expect(getterReads).toBe(0);
+
+    await completeHeldReplacement(a2, sub, 7n);
+    await m;
+    expect(getterReads).toBe(0);
     await player.destroy();
   });
 
@@ -11417,7 +12197,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a1.draftVersion = 16;
     const a3 = createMockAdapter();
     a3.draftVersion = 18;
-    const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
+    const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({}) as unknown as WebTransport);
     let cc = 0;
     const createConnection = vi.fn(() => (cc++ === 0 ? a1 : a3) as unknown as MoqtConnection);
     const player = new MoqtPlayer({
@@ -11435,15 +12215,18 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.close = vi.fn(async () => {});
     const m = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    await acceptReplacement(a2);
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled()); // parked in retirement
 
     // A LIVE GOAWAY from the committed session while the old close is pending.
-    a2._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://goaway-target.example.com/moq' } as unknown as ControlMessage);
+    a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
     expect(cc).toBe(1); // NOT acted on yet — no replacement adapter created (no leak)
 
     releaseOldClose!(); // retirement finishes → the queued GOAWAY is processed
     await m;
     await resolveConnect(a3);
+    // The second replacement must be usable too before it is adopted.
+    await acceptReplacement(a3);
     await vi.waitFor(() => expect((player as unknown as { connection: unknown }).connection).toBe(a3));
     expect(cc).toBe(2); // a3 created only when the queued GOAWAY was acted on
     await player.destroy();
@@ -11452,7 +12235,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
   it('an old-session GOAWAY during establishment is ignored after the caller\'s handoff commits', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
-    const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
+    const createTransport = vi.fn<NonNullable<MoqtPlayerConfig['createTransport']>>(async () => ({}) as unknown as WebTransport);
     let cc = 0;
     const createConnection = vi.fn(() => { cc++; return a1 as unknown as MoqtConnection; }); // only a1 is auto-created (load)
     const player = new MoqtPlayer({
@@ -11473,9 +12256,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // The OLD session (a1, still current during a2's establishment) sends GOAWAY —
     // it passes the ownership guard and is queued, but its source is a1.
-    a1._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://unwanted-target.example.com/moq' } as unknown as ControlMessage);
+    a1._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://unwanted-target.example.com/moq' });
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await m;
     expect((player as unknown as { connection: unknown }).connection).toBe(a2); // caller's replacement kept
 
@@ -11532,7 +12315,7 @@ describe('MSE gap-jump escalation and wiring', () => {
     await resolveConnect(adapter);
     await loadPromise;
     ackCatalog(adapter);
-    adapter._triggerObject(0n, {
+    adapter._triggerObject(0n, { publisherPriority: 128,
       kind: 'data', trackAlias: varint(1),
       groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
       payload: new TextEncoder().encode(CMAF_INLINE_CATALOG),
@@ -11596,28 +12379,9 @@ describe('MSE gap-jump escalation and wiring', () => {
     await player.destroy();
   });
 
-  it('a committed seek cancels the episode, before the pipeline resets', async () => {
-    // Cancellation belongs at the commit boundary: every guard has passed and
-    // `seeking` has been published, so the seek really does supersede playback.
-    const { player, mockMs } = await cmafPlayer();
-    const order: string[] = [];
-    (mockMs as any).cancelStallEpisode = () => order.push('cancel');
-    (player as any).videoPipeline = {
-      reset: () => order.push('reset'), tick: () => {}, destroy: () => {},
-    };
-    (player as any).timelineState = {
-      entries: [{ mediaPts: 0, location: [0, 0] as const, wallclockTime: 0 }],
-    };
-    player.play();
-
-    mockMs.onStall(250);
-    await player.seek(1_000).catch(() => { /* downstream update is not under test */ });
-
-    expect(order[0]).toBe('cancel');
-    expect(order).toContain('reset');
-    await player.destroy();
-  });
-
+  // The committed-seek cancellation boundary is covered durably by the owned-seek fixture
+  // (player-seek-output.loopback: 'keeps the old stall eligible during preparation and cancels it before native
+  // replacement'); the legacy mock here has no owned seek output, so a seek cannot reach the commit boundary.
   it('a rejected seek does not censor a live stall', async () => {
     // A seek that changes no playback state must leave a running outage alone.
     const { player, mockMs } = await cmafPlayer();

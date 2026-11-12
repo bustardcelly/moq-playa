@@ -19,6 +19,15 @@ import type { RecoveryAction, DecoderCommand } from '@openmoq/playback';
 import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@openmoq/msf';
 import type { EmsgEvent } from '@openmoq/locmaf';
 import type { PlayerError } from './errors.js';
+import type { MediaSelectionSnapshot } from './player-selection-state.js';
+
+/** The engine's accepted/adopted output selection or available choices changed. */
+export interface SelectionChangedEvent {
+  readonly type: 'selection_changed';
+  readonly selection: MediaSelectionSnapshot;
+  /** A defensive copy from the same adopted context as the selection. */
+  readonly catalog: CatalogState | null;
+}
 
 // ─── Session Events ──────────────────────────────────────────────────
 
@@ -51,9 +60,45 @@ export interface SessionGoawayEvent {
 }
 
 /**
+ * GOAWAY received on ONE request stream — a per-request migration signal that
+ * leaves the rest of the session in place. Unrelated subscriptions keep
+ * delivering and the session does not drain, so this deliberately does NOT
+ * emit `session_goaway`: a listener on that event may reconnect the whole
+ * player, which is the wrong response to a single request migrating.
+ *
+ * Re-issuing the request is application policy; nothing is re-issued
+ * automatically.
+ *
+ * @see draft-ietf-moq-transport-18 §10.4
+ * @see draft-ietf-moq-transport-22 §9.2, §6.6.1
+ */
+export interface RequestGoawayEvent {
+  readonly type: 'request_goaway';
+  /** The request the peer asked to migrate, from its stream context. */
+  readonly requestId: bigint;
+  /** Where to re-issue it; empty means the current session. */
+  readonly newSessionUri: string;
+  /** Track name when the request was a known media or catalog subscription. */
+  readonly trackName?: string;
+}
+
+/**
  * Session migrated to a new relay after GOAWAY.
+ *
+ * Emitted ONCE, after the replacement has been adopted — meaning its catalog
+ * converged through its own retrieval, the required playback set was ACCEPTED
+ * by the new relay, usable initialization is in hand, and it is now the
+ * authoritative session. The replacement is established before the old
+ * session's subscriptions are cancelled, so this is not a gap announcement.
+ *
+ * It is not evidence of rendered output: it says the session was replaced
+ * without interrupting playback, not that a frame has been presented since.
+ * A failed attempt emits nothing — playback simply continues on the old
+ * session, and the failure is reported through the error channel.
+ *
  * @see draft-ietf-moq-transport-16 §3.5 (Migration)
  * @see draft-ietf-moq-transport-16 §8.4.1 (Graceful Subscriber Relay Switchover)
+ * @see draft-ietf-moq-transport-22 §7.4.1 (new subscriptions succeed, then the old are cancelled)
  */
 export interface SessionMigratedEvent {
   readonly type: 'session_migrated';
@@ -218,8 +263,10 @@ export interface KeyframeWaitingEvent {
 }
 
 /**
- * Track has ended (PUBLISH_DONE with TRACK_ENDED received).
- * @see draft-ietf-moq-transport-16 §9.15 (PUBLISH_DONE status 0x2)
+ * The track ended after an observed END_OF_TRACK or drained TRACK_ENDED publication.
+ * PUBLISH_DONE receipt alone is not a data-delivery barrier; filter completion does not assert track completion.
+ * This does not assert that all frames were presented or that the shared MSE media element has ended.
+ * @see draft-ietf-moq-transport-16 §10.2.1.1, §9.15
  */
 export interface TrackEndedEvent {
   readonly type: 'track_ended';
@@ -378,9 +425,9 @@ export interface GapJumpEvent {
 
 /**
  * Quality switch initiated (ABR) — `selectVideoTrack` accepted the
- * request and started subscribing to the new track. The switch is NOT
- * yet committed; expect either `quality_switched` (success) or
- * `quality_switch_failed` (rollback) to follow.
+ * request and started preparing the new track. The switch is NOT yet
+ * committed; expect `quality_switched` (success), `quality_switch_failed`
+ * (rollback), or a fatal error if the running source cannot be restored.
  *
  * UI affordance: render a "switching to ..." spinner here.
  *
@@ -598,8 +645,9 @@ export interface LocmafEventReceivedEvent {
 // ─── Seek Events ────────────────────────────────────────────────────
 
 /**
- * Seek operation initiated — pipelines being reset, REQUEST_UPDATE being sent.
- * @see draft-ietf-moq-transport-16 §9.2.2.5 (SUBSCRIPTION_FILTER in REQUEST_UPDATE)
+ * Seek preparation initiated for the requested content position. Built-in MSE
+ * and frame paths prepare owned historical output; the legacy fallback updates
+ * subscription filters in place. This event does not prove output readiness.
  * @see draft-ietf-moq-msf-00 §7 (Media Timeline for PTS→location lookup)
  */
 export interface SeekingEvent {
@@ -608,8 +656,11 @@ export interface SeekingEvent {
 }
 
 /**
- * Seek operation complete — REQUEST_UPDATE sent, awaiting objects at new position.
- * @see draft-ietf-moq-transport-16 §9.2.2.5 (SUBSCRIPTION_FILTER)
+ * Built-in MSE/frame seek output established this content position. Native
+ * MSE positioning and producing frame/audio timing do not prove paint or literal
+ * speaker output. The legacy subscription-update fallback emits this event
+ * optimistically after dispatch, before output is proven.
+ * @see draft-ietf-moq-msf-01 §7.2 (Media Timeline)
  */
 export interface SeekedEvent {
   readonly type: 'seeked';
@@ -636,10 +687,12 @@ export interface StateChangedEvent {
  * Used as the type parameter for TypedEmitter<PlayerEventMap>.
  */
 export interface PlayerEventMap {
+  selection_changed: SelectionChangedEvent;
   // Session
   session_connecting: SessionConnectingEvent;
   session_established: SessionEstablishedEvent;
   session_goaway: SessionGoawayEvent;
+  request_goaway: RequestGoawayEvent;
   session_migrated: SessionMigratedEvent;
   session_closed: SessionClosedEvent;
   session_error: SessionErrorEvent;

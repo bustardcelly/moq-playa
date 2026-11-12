@@ -15,6 +15,11 @@
 
 export { MoqtPlayer } from './player.js';
 export type { SubscribeIntent, QualitySwitchIntent } from './player.js';
+export type { MediaSelectionSnapshot, AudioSelectionOptions, AudioTimelineReference,
+  MediaSelectionOptions, MediaTimelineAnchor, MediaTimelineReference } from './player-selection-state.js';
+export type { TrackIdentity, ScopeId } from './catalog-selection.js';
+export { buildCatalogSelection } from './catalog-selection.js';
+export type { CatalogSelection, SelectionScope, AlternateSet, SelectableTrack } from './catalog-selection.js';
 
 // ─── Capability Detection ─────────────────────────────────────────────
 
@@ -25,10 +30,12 @@ export type { SupportReport } from './support.js';
 
 export type {
   PlayerEventMap,
+  SelectionChangedEvent,
   PlayerEvent,
   SessionConnectingEvent,
   SessionEstablishedEvent,
   SessionGoawayEvent,
+  RequestGoawayEvent,
   SessionClosedEvent,
   SessionErrorEvent,
   PlayerErrorEvent,
@@ -88,7 +95,10 @@ export type { PlayerStateValue } from './state.js';
 
 // ─── Config ──────────────────────────────────────────────────────────
 
-export type { MoqtPlayerConfig } from './config.js';
+export type { MoqtPlayerConfig, SelectionConfig, TrackRefConfig } from './config.js';
+export type { PlayerAuthorization } from './config.js';
+export { catToken, AuthorizationError } from '@openmoq/webtransport';
+export type { AuthorizationToken, AuthorizationContext, AuthorizationProvider, AuthorizationOperation } from '@openmoq/webtransport';
 export {
   DEFAULT_GAP_TIMEOUT_MS,
   DEFAULT_DRIFT_THRESHOLD_MS,
@@ -117,8 +127,19 @@ export type {
   VideoDecoderLike,
   AudioDecoderLike,
   VideoRendererLike,
+  VideoPresentation,
   AudioOutputLike,
   MediaSourceLike,
+  MediaSeekResource,
+  MediaSwitchRecovery,
+  MediaSeekSample,
+  MediaAppendQueueLease,
+  CmafSourceReceipt,
+  VideoPlaybackQualityStats,
+  MediaAppendToken,
+  MediaAppendReason,
+  MediaAppendObservation,
+  MediaAppendObserver,
 } from './interfaces.js';
 
 // ─── Command Dispatcher ──────────────────────────────────────────────
@@ -132,7 +153,7 @@ export type { CommandDispatcherOptions } from './command-dispatcher.js';
 
 /** @experimental Advanced API — may change between minor versions. */
 export { StatsAccumulator } from './stats.js';
-export type { PlayerStats, TTFFBreakdown } from './stats.js';
+export type { PlayerStats, VideoEncodeObservation, TTFFBreakdown } from './stats.js';
 
 // ─── Internal managers (exported for advanced use / testing) ─────────
 
@@ -141,9 +162,14 @@ export { CatalogManager } from './catalog-manager.js';
 /** @experimental Advanced API — may change between minor versions. */
 export { QualityController } from './quality-controller.js';
 /** @experimental Advanced API — may change between minor versions. */
+export { composeSelection } from './selection-composition.js';
+/** @experimental Advanced API — may change between minor versions. */
+export { selectionIntentFromConfig } from './configured-selection.js';
+/** @experimental Advanced API — may change between minor versions. */
 export type { QualityControllerConfig, SelectionConstraints, SelectedTracks } from './quality-controller.js';
 /** @experimental Advanced API — may change between minor versions. */
 export { SubscriptionManager } from './subscription-manager.js';
+export type { ObjectRoutingContext, ObjectRoutingProvenance } from './subscription-manager.js';
 export type { TrackPackaging } from './subscription-manager.js';
 export { isMsePackaging, usesMsePath } from './packaging.js';
 export type { LocmafDecoding } from './packaging.js';
@@ -164,3 +190,16 @@ export {
   formatLogMessage,
 } from './trace-recorder.js';
 export type { TraceLimits, TraceLane, TraceRecorderOptions } from './trace-recorder.js';
+
+export type { PlayerDiagnosticConnection, PlayerConnectionObservation, PlayerDiagnosticSnapshot, PlayerDiagnosticTrack, PlayerDiagnosticSubscription, PlayerDiagnosticSource, PlayerDiagnosticFacade } from './diagnostics.js';
+
+export type { CmafAssemblyDiscardReason } from './interfaces.js';
+
+export type { MediaStageObservation, MediaStageObserver, MediaDiagnosticsFactory } from './media-diagnostic-types.js';
+
+export type { VideoFrameObservation, VideoFrameObserver, VideoFrameReason } from './interfaces.js';
+
+export type { AudioScheduleObservation, AudioScheduleObserver, AudioScheduleReason } from './interfaces.js';
+
+export type { FrameOutputAdapters, FrameOutputContext, FrameOutput } from './config.js';
+export type { AudioProducedTiming, AudioSourcePosition, VideoProducedTiming } from './interfaces.js';

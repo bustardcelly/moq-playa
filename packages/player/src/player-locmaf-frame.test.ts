@@ -20,11 +20,13 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { ObjectStatus, varint } from '@openmoq/transport';
-import type { ClockSource } from '@openmoq/playback';
+import type { PlaybackPipeline, ClockSource } from '@openmoq/playback';
+import type { AudioChunkInit, VideoChunkInit } from '@openmoq/loc';
 import { LocmafEncoder, LocmafGroupState, parseLocmafTrackContext, serializeLocmafObject, ticksToMicros } from '@openmoq/locmaf';
-import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, cencVideoInit, videoInit } from '../../locmaf/test-support/cmaf.js';
+import { NON_SYNC_FLAGS, SYNC_FLAGS, audioInit, buildChunk, cencVideoInit, videoInit } from '../../locmaf/test-support/cmaf.js';
 import { concat, fullBox, isoBox, u32 } from '../../locmaf/test-support/bytes.js';
 import { childBoxes } from '../../locmaf/src/iso-box.js';
+import { malformedRawInits } from '../test-support/locmaf.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const VECTORS = join(here, '..', '..', '..', 'conformance', 'media', 'vectors', 'locmaf');
@@ -45,7 +47,14 @@ function createMockAdapter() {
     unsubscribe: vi.fn(async () => {}),
     fetch: vi.fn(async () => varint(nextRequestId++)),
     fetchCancel: vi.fn(async () => {}),
-    trackStatus: vi.fn(async () => varint(nextRequestId++)),
+    // Mirrors the real contract: the pre-send ownership hook fires between
+    // request-ID allocation and wire emission, so a caller can register before
+    // any response (or a request-stream GOAWAY) can be handled.
+    trackStatus: vi.fn(async (_ns: unknown, _n: unknown, opts?: { onRequestId?: (id: bigint) => void }) => {
+      const requestId = varint(nextRequestId++);
+      opts?.onRequestId?.(BigInt(requestId));
+      return requestId;
+    }),
     subscribeNamespace: vi.fn(async () => varint(nextRequestId++)),
     cancelNamespace: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
@@ -78,6 +87,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function bootPlayer(catalogJson: string, cfg: Partial<MoqtPlayerConfig> = {}) {
   const adapter = createMockAdapter();
   const videoDecoder = mockVideoDecoder();
+  const audioDecoder = { configure: vi.fn(), decode: vi.fn<(chunk: AudioChunkInit, renderTimeUs: number) => void>(), flush: vi.fn(async () => {}), reset: vi.fn(), destroy: vi.fn(), queueDepth: 0, onData: null, onError: null };
   const renderer = mockRenderer();
   const mockMs = { initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), mediaElement: null, destroy: vi.fn(), changeType: vi.fn(async () => {}), onFirstFrame: null, onError: null, onStall: null };
   let clockTime = 1_000_000;
@@ -89,6 +99,7 @@ async function bootPlayer(catalogJson: string, cfg: Partial<MoqtPlayerConfig> = 
     createTransport: vi.fn(async () => ({}) as any),
     createConnection: () => adapter as unknown as MoqtConnection,
     createVideoDecoder: () => videoDecoder as any,
+    createAudioDecoder: () => audioDecoder,
     createRenderer: () => renderer as any,
     createMediaSource: () => mockMs as any,
     createCmafAssembler: () => ({ push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(), setInitSegment: vi.fn(), clearPending: vi.fn() }) as any,
@@ -108,7 +119,7 @@ async function bootPlayer(catalogJson: string, cfg: Partial<MoqtPlayerConfig> = 
   adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: catalogReqId, trackAlias: catalogReqId, parameters: new Map() } as unknown as ControlMessage);
   adapter._triggerObject(0n, {
     kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
-    objectId: varint(0), payload: new TextEncoder().encode(catalogJson),
+    objectId: varint(0), publisherPriority: 128, payload: new TextEncoder().encode(catalogJson),
   } as MoqtObject);
   await sleep(30);
 
@@ -124,7 +135,7 @@ async function bootPlayer(catalogJson: string, cfg: Partial<MoqtPlayerConfig> = 
     return idx >= 0 ? await adapter.subscribe.mock.results[idx]?.value : undefined;
   };
   const advance = (ms: number) => { clockTime += ms * 1000; };
-  return { player, adapter, videoDecoder, renderer, mockMs, errors, warnings, subscribedNames, reqIdFor, advance };
+  return { player, adapter, videoDecoder, audioDecoder, renderer, mockMs, errors, warnings, subscribedNames, reqIdFor, advance };
 }
 
 function sendLocmaf(adapter: any, alias: unknown, groupId: number, objectId: number, payload: Uint8Array): void {
@@ -140,6 +151,82 @@ const IDR = nal(5, 0x88, 0x84);
 const P_SLICE = nal(1, 0x9a, 0x10);
 
 describe('LOCMAF frame-path regressions', () => {
+  describe.each([false, true])('raw init validation (initialized=%s)', (initialized) => {
+    it.each(malformedRawInits(videoInit()))('rejects %s before frame initialization or delivery', async (_name, boxes) => {
+      const init = videoInit();
+      const h = await bootPlayer(
+        cmsfCatalog([{ ...LOCMAF_VIDEO, ...(initialized ? { initRef: 'v' } : {}) }],
+          initialized ? [{ id: 'v', type: 'inline', data: b64(init) }] : undefined),
+        { locmafDecoding: 'frame' },
+      );
+      try {
+        const alias = await h.reqIdFor('video');
+        h.videoDecoder.configure.mockClear();
+        sendLocmaf(h.adapter, alias, 5, 0, concat(Uint8Array.of(4), boxes));
+        expect((h.player as any).initSegmentByTrack.has('video')).toBe(false);
+        expect(h.videoDecoder.configure).not.toHaveBeenCalled();
+        expect(h.videoDecoder.decode).not.toHaveBeenCalled();
+        expect(h.mockMs.initialize).not.toHaveBeenCalled();
+        expect(h.mockMs.appendChunk).not.toHaveBeenCalled();
+        expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(1);
+        sendLocmaf(h.adapter, alias, 5, 1, serializeLocmafObject({ kind: 'rawBoxes', boxes: init }));
+        sendLocmaf(h.adapter, alias, 5, 2, locmafGroup(init, 90000, 1).objects[0]!);
+        for (let i = 0; i < 20; i++) {
+          h.advance(40);
+          h.player.tick();
+          await sleep(0);
+        }
+        expect(h.videoDecoder.decode).toHaveBeenCalledTimes(2);
+      } finally {
+        await h.player.destroy();
+      }
+    });
+  });
+
+  it.each(['video', 'audio'] as const)('preserves varying %s durations and composition offsets through chunk delivery', async (mediaType) => {
+    const init = mediaType === 'video' ? videoInit() : audioInit();
+    const context = parseLocmafTrackContext(init);
+    const track = mediaType === 'video' ? LOCMAF_VIDEO : {
+      name: 'audio', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, role: 'audio',
+      renderGroup: 1, codec: 'mp4a.40.2', samplerate: 48000, channelConfig: '2', bitrate: 128000,
+    };
+    const h = await bootPlayer(
+      cmsfCatalog([{ ...track, initRef: 'init' }], [{ id: 'init', type: 'inline', data: b64(init) }]),
+      { locmafDecoding: 'frame' },
+    );
+    try {
+      const samples = [
+        { duration: 3001, cto: 900, size: IDR.length, flags: SYNC_FLAGS },
+        { duration: 4507, cto: -450, size: P_SLICE.length, flags: NON_SYNC_FLAGS },
+        { duration: 2251, cto: 1350, size: P_SLICE.length, flags: NON_SYNC_FLAGS },
+      ];
+      const chunk = buildChunk({ trackId: context.trackId, bmdt: context.timescale, samples, mdat: concat(IDR, P_SLICE, P_SLICE) });
+      const payload = serializeLocmafObject(new LocmafEncoder().encode(chunk, new LocmafGroupState(), context, false, 0n));
+      sendLocmaf(h.adapter, await h.reqIdFor(mediaType), 5, 0, payload);
+      for (let i = 0; i < 20; i++) {
+        h.advance(40);
+        h.player.tick();
+        await sleep(0);
+      }
+      const delivered: Array<VideoChunkInit | AudioChunkInit> = mediaType === 'video'
+        ? h.videoDecoder.decode.mock.calls.map((call: any[]) => call[0] as VideoChunkInit)
+        : h.audioDecoder.decode.mock.calls.map(([chunk]) => chunk);
+      expect(delivered).toHaveLength(3);
+      expect(delivered.map((frame) => frame.duration)).toEqual(samples.map((sample) => Number(ticksToMicros(BigInt(sample.duration), context.timescale))));
+      expect(delivered.map((frame) => frame.timestamp)).toEqual(
+        [context.timescale + 900, context.timescale + 3001 - 450, context.timescale + 3001 + 4507 + 1350]
+          .map((time) => Number(ticksToMicros(BigInt(time), context.timescale))),
+      );
+      expect(delivered.map(frame => frame.sourceTimestamp)).toEqual(
+        [context.timescale + 900, context.timescale + 3001 - 450, context.timescale + 3001 + 4507 + 1350]
+          .map(time => ({ ticks: BigInt(time), ticksPerSecond: BigInt(context.timescale), domain: 'media' })),
+      );
+      expect(h.errors).toEqual([]);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
   it.each(['valid', 'wrong track', 'sample outside mdat'])(
     'validates rawBoxes before frame delivery: %s', async (variant) => {
       const init = videoInit();
@@ -218,7 +305,7 @@ describe('LOCMAF frame-path regressions', () => {
     }
   });
 
-  it.each<[string, Parameters<typeof buildChunk>[0]]>([
+  it.each<[string, Partial<Parameters<typeof buildChunk>[0]>]>([
     ['base data offset', { baseDataOffset: true }],
     ['sample groups in the traf', { extraTrafBoxes: [fullBox('sbgp', 0, 0, u32(0))] }],
     ['a trailing box', { trailing: [isoBox('free')] }],
@@ -418,7 +505,7 @@ describe('LOCMAF frame path (draft-einarsson-moq-locmaf-01 §16) — locmafDecod
       { locmafDecoding: 'frame' },
     );
     const alias = await reqIdFor('video');
-    const pushObject = vi.spyOn((player as any).videoPipeline, 'pushObject');
+    const pushObject = vi.spyOn((player as unknown as { videoPipeline: PlaybackPipeline }).videoPipeline, 'pushSampleObject');
 
     const { objects, samples } = locmafGroup(init, 90000, 2);
     objects.forEach((payload, i) => sendLocmaf(adapter, alias, 5, i, payload));
@@ -428,10 +515,16 @@ describe('LOCMAF frame path (draft-einarsson-moq-locmaf-01 §16) — locmafDecod
       await sleep(0);
     }
 
-    const pushed = pushObject.mock.calls.map((c: any[]) => c[1]);
+    const pushed = pushObject.mock.calls.flatMap(([, batch]) => batch.map(sample => sample.headers));
     const headers = pushed.find((h) => h?.captureTimestamp !== undefined)!;
     expect(headers).toBeDefined();
     expect(headers.timestampIsWallClock).toBe(false);
+    expect(headers.timestamp).toBe(BigInt(samples[0]!.decodeTime));
+    expect(headers.timescale).toBe(90000n);
+    const chunks = videoDecoder.decode.mock.calls.map((c: any[]) => c[0] as VideoChunkInit);
+    expect(chunks.map(c => c.sourceTimestamp)).toEqual(samples.map(s => ({
+      ticks: BigInt(s.decodeTime), ticksPerSecond: 90000n, domain: 'media',
+    })));
     await player.destroy();
   });
 

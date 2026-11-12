@@ -13,12 +13,18 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { SubscriptionManager } from './subscription-manager.js';
+import { SubscriptionManager, type ObjectDeliveryOptions } from './subscription-manager.js';
 import { varint } from '@openmoq/transport';
 import type { MoqtObject, MoqtObjectData } from '@openmoq/transport';
 import type { LocHeaders } from '@openmoq/loc';
 import { encodeLocHeaders } from '@openmoq/loc';
 import type { LocHeaderOptions } from '@openmoq/loc';
+
+// Private budget assertions need only the exact two existing field types.
+type PendingTransformBudget = {
+  readonly pendingLocmafTransforms: SubscriptionManager['pendingLocmafTransforms'];
+  readonly pendingLocmafTransformBytes: SubscriptionManager['pendingLocmafTransformBytes'];
+};
 
 /** Create a mock MoqtObjectData. */
 function createMockObject(overrides?: Partial<MoqtObjectData>): MoqtObjectData {
@@ -36,6 +42,106 @@ function createMockObject(overrides?: Partial<MoqtObjectData>): MoqtObjectData {
 }
 
 describe('SubscriptionManager', () => {
+  it('invalidates deferred LOCMAF transforms by connection, alias and group', async () => {
+    const mgr = new SubscriptionManager();
+    mgr.registerTrack(1n, 'video', 'video', 'locmaf');
+    const callback = vi.fn();
+    mgr.onLocmafObject = callback;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    mgr.objectTransform = async (object) => { await gate; return object; };
+    const a = {};
+    const b = {};
+    const tasks = [mgr.routeObject(1n, createMockObject(), 18, a),
+      mgr.routeObject(2n, createMockObject(), 18, b),
+      mgr.routeObject(3n, createMockObject({ groupId: varint(1) }), 18, a)];
+    mgr.invalidateLocmafGroup(1n, 0n, a);
+    release();
+    await Promise.all(tasks);
+    expect(callback).toHaveBeenCalledTimes(2);
+    expect(callback.mock.calls.map((call) => call[2].groupId)).toEqual([0n, 1n]);
+  });
+
+  it.each(['unregister', 'replace', 'clear'] as const)('retires deferred LOCMAF delivery on %s', async (operation) => {
+    const mgr = new SubscriptionManager();
+    mgr.registerTrack(1n, 'video', 'video', 'locmaf');
+    mgr.onLocmafObject = vi.fn();
+    mgr.onMalformedTrack = vi.fn();
+    let reject!: (error: Error) => void;
+    mgr.objectTransform = () => new Promise((_resolve, fail) => { reject = fail; });
+    const task = mgr.routeObject(1n, createMockObject());
+    if (operation === 'unregister') mgr.unregisterTrack(1n);
+    else if (operation === 'replace') mgr.registerTrack(1n, 'new-video', 'video', 'locmaf');
+    else mgr.clear();
+    reject(new Error('late transform failure'));
+    await task;
+    expect(mgr.onLocmafObject).not.toHaveBeenCalled();
+    expect(mgr.onMalformedTrack).not.toHaveBeenCalled();
+    expect((mgr as unknown as PendingTransformBudget).pendingLocmafTransforms.size).toBe(0);
+    expect((mgr as unknown as PendingTransformBudget).pendingLocmafTransformBytes).toBe(0);
+  });
+
+  it('registers the LOCMAF transform guard before a reentrant reset', async () => {
+    const mgr = new SubscriptionManager();
+    mgr.registerTrack(1n, 'video', 'video', 'locmaf');
+    mgr.onLocmafObject = vi.fn();
+    mgr.objectTransform = (object) => { mgr.invalidateLocmafGroup(1n, 0n); return object; };
+    await mgr.routeObject(1n, createMockObject());
+    expect(mgr.onLocmafObject).not.toHaveBeenCalled();
+  });
+
+  it.each(['count', 'bytes'] as const)('bounds deferred LOCMAF transforms by %s', async (limit) => {
+    const mgr = new SubscriptionManager();
+    mgr.registerTrack(1n, 'video', 'video', 'locmaf');
+    mgr.onLocmafObject = vi.fn();
+    const onMalformedTrack = vi.fn<NonNullable<SubscriptionManager['onMalformedTrack']>>();
+    mgr.onMalformedTrack = onMalformedTrack;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    mgr.objectTransform = async (object) => { await gate; return object; };
+    const payloads = limit === 'count' ? Array.from({ length: 257 }, () => new Uint8Array(1))
+      : [new Uint8Array(8 * 1024 * 1024), new Uint8Array(1)];
+    const tasks = payloads.map((payload) => mgr.routeObject(1n, createMockObject({ payload })));
+    expect(mgr.onMalformedTrack).toHaveBeenCalledTimes(1);
+    expect(onMalformedTrack.mock.calls[0]?.[3].message).toContain('capacity exceeded');
+    expect((mgr as unknown as PendingTransformBudget).pendingLocmafTransforms.size).toBe(limit === 'count' ? 256 : 1);
+    mgr.clear();
+    release();
+    await Promise.all(tasks);
+    expect(mgr.onLocmafObject).not.toHaveBeenCalled();
+    expect((mgr as unknown as PendingTransformBudget).pendingLocmafTransformBytes).toBe(0);
+  });
+
+  it.each(['count', 'bytes'] as const)('keeps the %s budget charged until invalidated work settles', async (limit) => {
+    const mgr = new SubscriptionManager();
+    mgr.registerTrack(1n, 'video', 'video', 'locmaf');
+    mgr.onLocmafObject = vi.fn();
+    mgr.onMalformedTrack = vi.fn();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const transform = vi.fn(async (object: MoqtObject) => { await gate; return object; });
+    mgr.objectTransform = transform;
+    const payloads = limit === 'count' ? Array.from({ length: 256 }, () => new Uint8Array(1))
+      : [new Uint8Array(8 * 1024 * 1024)];
+    const tasks = payloads.map((payload) => mgr.routeObject(1n, createMockObject({ payload })));
+    mgr.invalidateLocmafGroup(1n, 0n);
+    mgr.unregisterTrack(1n);
+    mgr.registerTrack(1n, 'replacement', 'video', 'locmaf');
+    mgr.clear();
+    mgr.registerTrack(1n, 'video', 'video', 'locmaf');
+    tasks.push(mgr.routeObject(1n, createMockObject({ payload: new Uint8Array(1) })));
+    expect(mgr.onMalformedTrack).toHaveBeenCalledTimes(1);
+    expect(transform).toHaveBeenCalledTimes(payloads.length);
+    expect((mgr as unknown as PendingTransformBudget).pendingLocmafTransforms.size).toBe(payloads.length);
+    release();
+    await Promise.all(tasks);
+    expect(mgr.onLocmafObject).not.toHaveBeenCalled();
+    expect((mgr as unknown as PendingTransformBudget).pendingLocmafTransforms.size).toBe(0);
+    expect((mgr as unknown as PendingTransformBudget).pendingLocmafTransformBytes).toBe(0);
+    await mgr.routeObject(1n, createMockObject());
+    expect(mgr.onLocmafObject).toHaveBeenCalledTimes(1);
+  });
+
   it('registers a track alias mapping', () => {
     const mgr = new SubscriptionManager();
     mgr.registerTrack(1n, 'video', 'video');
@@ -488,7 +594,8 @@ describe('SubscriptionManager', () => {
     expect(onLocmafObject).toHaveBeenCalledWith(
       'video',
       'video',
-      expect.objectContaining({ kind: 'data' }),
+      createMockObject({ trackAlias: varint(1) }),
+      undefined, checkedDelivery(mgr, onLocmafObject.mock.calls[0]![4]),
     );
     expect(onCmafObject).not.toHaveBeenCalled();
     expect(onObject).not.toHaveBeenCalled();
@@ -518,7 +625,8 @@ describe('SubscriptionManager', () => {
     expect(onLocmafObject).toHaveBeenCalledWith(
       'audio',
       'audio',
-      expect.objectContaining({ payload: new Uint8Array([0xCA, 0xFE]) }),
+      { ...createMockObject({ trackAlias: varint(1) }), payload: new Uint8Array([0xCA, 0xFE]) },
+      undefined, checkedDelivery(mgr, onLocmafObject.mock.calls[0]![4]),
     );
 
     mgr.objectTransform = () => null;
@@ -543,7 +651,8 @@ describe('SubscriptionManager', () => {
     await mgr.routeObject(0n, createMockObject({ trackAlias: varint(3) }));
 
     expect(onLocmafObject).toHaveBeenCalledTimes(1);
-    expect(onLocmafObject).toHaveBeenCalledWith('video', 'video', expect.anything());
+    expect(onLocmafObject).toHaveBeenCalledWith('video', 'video', createMockObject({ trackAlias: varint(1) }),
+      undefined, checkedDelivery(mgr, onLocmafObject.mock.calls[0]![4]));
     expect(onObject).toHaveBeenCalledTimes(1);
     expect(onObject).toHaveBeenCalledWith('audio', 'audio', expect.anything(), expect.anything());
     expect(onCmafObject).toHaveBeenCalledTimes(1);
@@ -753,7 +862,7 @@ describe('SubscriptionManager', () => {
 
     /** Encode a Capture Timestamp under an explicit wire profile. */
     const encodeTs = (profile: LocHeaderOptions['wireProfile']): Uint8Array =>
-      encodeLocHeaders({ captureTimestamp: TS }, { wireProfile: profile })!;
+      encodeLocHeaders({ captureTimestamp: TS }, profile === undefined ? {} : { wireProfile: profile })!;
 
     it('draft-18 SubscriptionManager decodes a vi64 Capture Timestamp to the exact bigint', async () => {
       const mgr = new SubscriptionManager();
@@ -828,3 +937,13 @@ describe('SubscriptionManager', () => {
     });
   });
 });
+
+function checkedDelivery(manager: SubscriptionManager, value: unknown): ObjectDeliveryOptions {
+  const delivery = value as ObjectDeliveryOptions;
+  expect(delivery).toBeDefined();
+  expect(typeof delivery.isLive).toBe('function');
+  expect(delivery.isLive!()).toBe(true);
+  manager.invalidateMediaInputs();
+  expect(delivery.isLive!()).toBe(false);
+  return delivery;
+}

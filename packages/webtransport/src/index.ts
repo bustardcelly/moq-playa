@@ -4,8 +4,24 @@
  */
 
 export { MoqtConnection } from './adapter.js';
-export type { TrackSubscription, TrackSubscribeOptions, IncomingPublish } from './adapter.js';
-export type { DataStreamTerminal } from './adapter.js';
+export type { ObjectReceipt, ObjectReceiptObservation, ObjectReceiptDiscard } from './object-receipts.js';
+export { OBSERVED_PROPERTIES_LIMIT } from './object-reception.js';
+export type {
+  ObjectReception,
+  ObjectReceptionEvent,
+  ObjectReceptionHeader,
+  ObjectReceptionProgress,
+  ObjectReceptionEnd,
+  ObjectReceptionDatagram,
+  ObjectReceptionOrigin,
+  ObjectReceptionInterruption,
+  ObjectReceptionPropertiesOmission,
+  ObjectReceptionOptions,
+} from './object-reception.js';
+export type { TrackSubscription, TrackSubscribeOptions, IncomingPublish, ConnectOptions } from './adapter.js';
+export { catToken, AuthorizationError } from './authorization.js';
+export type { AuthorizationToken, AuthorizationContext, AuthorizationOperation, AuthorizationProvider, ConnectionAuthorization } from './authorization.js';
+export type { DataStreamTerminal, GoawayNotice } from './adapter.js';
 export type {
   WebTransportLike,
   WebTransportBidirectionalStream,
@@ -29,3 +45,5 @@ export type { BidiControlTopology } from './topology/bidi-control.js';
 export { createUniPairTopology, UniPairTopology } from './topology/uni-pair.js';
 /** @experimental */
 export type { RequestStream } from './topology/uni-pair.js';
+
+export type { FetchReceiver, FetchReceiveContext } from './fetch-receiver.js';

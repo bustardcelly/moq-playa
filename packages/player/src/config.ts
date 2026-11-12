@@ -12,13 +12,15 @@
  * @module
  */
 
-import type { MoqtConnection, WebTransportLike } from '@openmoq/webtransport';
+import type { MoqtConnection, WebTransportLike, ConnectionAuthorization } from '@openmoq/webtransport';
 import type { QlogEvent, MoqtObject, DraftVersion } from '@openmoq/transport';
 import type { TrackConstraints, CatalogTrack, CatalogState } from '@openmoq/msf';
+import { assertUtf8EncodableIdentity, contextFields, fieldsFromCatalogText } from '@openmoq/msf';
 import type { ClockSource, DecoderCommand, RecoveryController } from '@openmoq/playback';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, MediaSourceLike, CmafAssemblerLike } from './interfaces.js';
 import type { PlayerError } from './errors.js';
 import type { LogLevel, LoggerLike } from './logger.js';
+import { preferredLanguage } from './language-preference.js';
 
 // ─── Known Track Metadata (TTFF optimization) ────────────────────────
 
@@ -63,6 +65,11 @@ export interface KnownTrackConfig {
 
 // ─── Category Interfaces (documentation grouping — type stays flat) ───
 
+export interface PlayerAuthorization extends Omit<ConnectionAuthorization, 'relayUrl'> {
+  /** Additional trusted relay origins for GOAWAY migration. Default: original origin only. */
+  readonly allowedRelayOrigins?: readonly string[];
+}
+
 /** Connection options. */
 export interface ConnectionConfig {
   /** WebTransport URL to the relay (e.g., "https://relay.example.com/moq"). */
@@ -104,6 +111,12 @@ export interface ConnectionConfig {
    * publisher you intend to subscribe to.
    */
   readonly namespace: string | readonly string[];
+
+  /**
+   * Compatibility override for nonstandard catalog track names.
+   * Default: 'catalog', as required by MSF-01 §5.
+   */
+  readonly catalogTrackName?: string;
 
   /**
    * MAX_REQUEST_ID for the MOQT session. Default: 100.
@@ -154,6 +167,8 @@ export interface ConnectionConfig {
    * @see draft-ietf-moq-transport-16 §9.3.1.5
    */
   readonly authTokens?: Uint8Array[];
+  /** Credentials for SETUP and every authorized request, including recovery and reconnects. */
+  readonly authorization?: PlayerAuthorization;
 
   /**
    * MOQT implementation identifier included in CLIENT_SETUP.
@@ -290,19 +305,23 @@ export interface PlaybackTuningConfig {
   };
 
   /**
-   * Warm-start the current group at initial tune-in (§5.1.3 "Joining an
-   * Ongoing Track"): live LOC media tracks subscribe with the Largest Object
-   * filter and immediately issue a relative Joining FETCH (Joining Start 0,
-   * §9.16.2 / draft-18 §10.12.2) referencing the SUBSCRIBE, so the current
-   * group's head plays immediately instead of waiting for the next group
-   * boundary. The FETCH and the live subscription are contiguous and
-   * non-overlapping by construction (§9.16.2.1).
+   * Warm-start the current group at initial tune-in instead of waiting for
+   * the next group boundary. Drafts 14/16/18 pair a Largest Object SUBSCRIBE
+   * with a relative Joining FETCH (Joining Start 0, draft-16 §9.16.2 /
+   * draft-18 §10.12.2). Its saved Largest Location makes the two ranges
+   * contiguous and non-overlapping. Draft 22 uses a Next Object SUBSCRIBE
+   * with an initial fill for the current group (§3.4 / §3.5).
    *
-   * Scope: initial tune-in only (never ABR switches), live LOC tracks only —
-   * CMAF tracks keep their normal boundary start (MSE append ordering is not
-   * warm-start safe yet) and non-live tracks already start from group 0. A
-   * refused FETCH is non-fatal: playback continues live-only from the next
-   * group boundary.
+   * Scope: initial tune-in only (never ABR switches), live LOC, CMAF and
+   * LOCMAF tracks. Non-live tracks already start from group 0. The saved
+   * Largest Location bounds a contiguous prefix; live tail processing waits
+   * for that prefix, including asynchronous object transforms. The sequencing
+   * gate has a 100-data-object / 4 MiB budget and a one-second readiness deadline,
+   * plus one zero-byte EndOfTrack marker independent of the data budget.
+   * Expiry fences late transforms; their resources remain owned until settlement.
+   * A refused, incomplete or expired prefix falls back to a later live group
+   * start; terminal completion markers retain their separate control path.
+   * These bounds and fallback behavior are player policy, not wire rules.
    *
    * Default: off. Incompatible with an explicit `subscriptionFilter` other
    * than `'LargestObject'` — draft-16 §9.16.2 closes the session when a
@@ -395,15 +414,75 @@ export interface QualityConfig {
   readonly videoConstraints?: TrackConstraints;
 
   /**
+   * Video alternate group to select at tune-in. Omitted: first video group.
+   * Quality selection and ABR stay within this group. Selecting another group
+   * requires a new player; groups need not share a media timeline or Group IDs.
+   * Cannot be combined with the catalog-free knownTracks fast path.
+   * @see draft-ietf-moq-msf-01 §4.2, §5.2.12
+   */
+  readonly videoAltGroup?: number;
+
+  /**
    * Constraints for initial audio track selection from altGroup.
    * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
    */
   readonly audioConstraints?: TrackConstraints;
 
+  /**
+   * Ordered basic language ranges for automatic audio choice within the chosen
+   * scope. Exact tags precede regional variants; unmatched preferences retain
+   * the scope-local default. Explicit track pins and audioConstraints still
+   * apply. Omitted: catalog order, unchanged.
+   */
+  readonly audioLanguages?: readonly string[];
+
+  /**
+   * An explicit presentation choice, resolved against the catalog.
+   *
+   * Every field omitted means "apply the documented default", so this changes
+   * nothing until something is named. A selector that cannot be satisfied is
+   * reported, never substituted: a caller who names a render group, an
+   * alternate group or a track gets that or an error.
+   *
+   * @see draft-ietf-moq-msf-01 §4.2, §5.2.12 (alternate groups)
+   * @see draft-ietf-moq-msf-01 §5.6.15 (render groups)
+   */
+  readonly selection?: SelectionConfig;
+
   /** Never select a video track, regardless of catalog contents. Default: false. */
   readonly disableVideo?: boolean;
   /** Never select an audio track, regardless of catalog contents. Default: false. */
   readonly disableAudio?: boolean;
+}
+
+/**
+ * A track as a CONFIG author names it.
+ *
+ * `namespace` omitted means the namespace the catalog was retrieved under,
+ * which msf-01 §5.2.2 makes the inherited namespace of any track declaring
+ * none. A string is catalog TEXT, canonicalized by this library's
+ * split-on-slash convention; an array is the wire tuple, used verbatim — the
+ * only way to name a track whose single namespace field contains a slash.
+ *
+ * @see draft-ietf-moq-transport-22 §2.4.1 (namespace is an ordered field set)
+ */
+export interface TrackRefConfig {
+  readonly name: string;
+  readonly namespace?: string | readonly string[];
+}
+
+/**
+ * An explicit presentation choice.
+ *
+ * `renderGroup: null` names the tracks that declare no render group, so "no
+ * render group" is a choice rather than a missing field.
+ */
+export interface SelectionConfig {
+  readonly renderGroup?: number | null;
+  readonly videoAltGroup?: number;
+  readonly videoTrack?: TrackRefConfig;
+  readonly audioAltGroup?: number;
+  readonly audioTrack?: TrackRefConfig;
 }
 
 /** Recovery options. */
@@ -551,6 +630,15 @@ export interface FactoryConfig {
   readonly createAudioOutput?: () => AudioOutputLike;
 
   /**
+   * Return fresh videoDecoder/renderer and/or audioDecoder/audioOutput pairs
+   * for the requested roles. Keep them inactive until onAdopt; the engine
+   * owns their destruction. Neither preparation nor onRetire may destroy or
+   * reset the current graph. Return a plain record with own data properties;
+   * allocations not returned remain the factory's responsibility.
+   */
+  readonly createFrameOutput?: (context: Readonly<FrameOutputContext>) => FrameOutput;
+
+  /**
    * Factory for the MseMediaSource (CMAF/MSE fallback).
    * When provided, CMAF-packaged tracks are routed directly to the
    * MseMediaSource instead of through the PlaybackPipeline.
@@ -565,8 +653,9 @@ export interface FactoryConfig {
    * @see draft-ietf-moq-cmsf-00 §3.3 (Object Packaging)
    */
   readonly createCmafAssembler?: (options: {
-    onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string, groupId: bigint) => void;
-    onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
+    onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string, groupId: bigint, inputs?: readonly (object | undefined)[], sourceKey?: string) => void;
+    onDiscard?: (input: object, reason: import('./interfaces.js').CmafAssemblyDiscardReason) => void;
+    onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string, sourceKey?: string) => void;
   }) => CmafAssemblerLike;
 
   /**
@@ -695,6 +784,7 @@ export const DEFAULT_PLAYER_CONFIG = {
   reconnectDelayMs: 1_000,
   reconnectBackoff: 'exponential' as const,
   moqtImplementation: 'proto-moq',
+  catalogTrackName: 'catalog',
 
   // Playback tuning
   gapTimeoutMs: 500,
@@ -739,12 +829,128 @@ export const DEFAULT_PLAYER_CONFIG = {
 // ─── Validation ──────────────────────────────────────────────────────
 
 /**
- * Validate player configuration. Throws on invalid values.
+ * Validate `selection`, before anything is requested.
  *
- * Called at construction time — bad config fails fast, not 30 seconds
- * into a stream.
+ * Two rules, both about refusing rather than guessing. A selector that
+ * contradicts an ENABLED shorthand is an error, because a caller who wrote
+ * both meant something; and a selector the catalog-free `knownTracks` path
+ * cannot express is an error, because that path subscribes without a catalog
+ * and has nothing to resolve a render group or an identity against. A
+ * selector for media that is DISABLED is ignored, which is the reviewed
+ * ignored-selector rule — disabling is the stronger statement.
  */
+function validateSelection(config: MoqtPlayerConfig): void {
+  const selection = config.selection;
+  if (selection === undefined) return;
+  if (typeof selection !== 'object' || selection === null) {
+    throw new TypeError('selection must be an object');
+  }
+  if (selection.renderGroup !== undefined && selection.renderGroup !== null
+    && !Number.isSafeInteger(selection.renderGroup)) {
+    throw new RangeError('selection.renderGroup must be a safe integer or null');
+  }
+  for (const field of ['videoAltGroup', 'audioAltGroup'] as const) {
+    const value = selection[field];
+    if (value !== undefined && !Number.isSafeInteger(value)) {
+      throw new RangeError(`selection.${field} must be a safe integer`);
+    }
+  }
+  for (const [field, disabled] of [
+    ['videoTrack', config.disableVideo], ['audioTrack', config.disableAudio],
+  ] as const) {
+    const track = selection[field];
+    if (track === undefined || disabled) continue;
+    if (typeof track !== 'object' || track === null || typeof track.name !== 'string') {
+      throw new TypeError(`selection.${field} must be a track reference with a name`);
+    }
+    // The same byte contract the catalog package enforces, through its own
+    // validator rather than a second scanner here.
+    assertUtf8EncodableIdentity(contextFields(track.namespace), track.name);
+  }
+  // A contradiction between the shorthand and the selector is refused, not
+  // resolved by precedence. Only when video is actually enabled: with video
+  // disabled neither selector means anything.
+  if (!config.disableVideo && config.videoAltGroup !== undefined
+    && selection.videoAltGroup !== undefined
+    && config.videoAltGroup !== selection.videoAltGroup) {
+    throw new TypeError(
+      `videoAltGroup ${config.videoAltGroup} contradicts selection.videoAltGroup `
+      + `${selection.videoAltGroup}; specify one`,
+    );
+  }
+  if (!config.knownTracks || config.catalog) return;
+  // The catalog-free fast path cannot express any of these.
+  const unsupported = ([
+    ['renderGroup', selection.renderGroup !== undefined && !(config.disableVideo && config.disableAudio)],
+    ['videoAltGroup', selection.videoAltGroup !== undefined && !config.disableVideo],
+    ['videoTrack', selection.videoTrack !== undefined && !config.disableVideo],
+    ['audioAltGroup', selection.audioAltGroup !== undefined && !config.disableAudio],
+    ['audioTrack', selection.audioTrack !== undefined && !config.disableAudio],
+  ] as const).filter(([, present]) => present).map(([field]) => field);
+  if (unsupported.length > 0) {
+    throw new TypeError(
+      `selection.${unsupported.join(', selection.')} cannot be combined with knownTracks: `
+      + 'that path subscribes without a catalog and has nothing to resolve the selection against. '
+      + 'Supply a catalog, or drop the selection.',
+    );
+  }
+}
+
+/** Full Track Name payload bound: drafts 16/18 §2.4.1; draft 22 §8.7. */
+const MAX_FULL_TRACK_NAME_BYTES = 4096;
+
+/**
+ * Refuse a catalog Full Track Name that could never be subscribed, before
+ * connecting rather than inside the first SUBSCRIBE. Lengths are UTF-8
+ * bytes, the form they take on the wire. An empty name is valid.
+ */
+function assertCatalogFullTrackNameFits(config: MoqtPlayerConfig): void {
+  const ns = config.namespace;
+  const fields = typeof ns === 'string' ? fieldsFromCatalogText(ns)
+    : Array.isArray(ns) && ns.every(field => typeof field === 'string') ? ns : undefined;
+  if (fields === undefined) return;
+  const enc = new TextEncoder();
+  const name = config.catalogTrackName ?? 'catalog';
+  const total = fields.reduce((sum, field) => sum + enc.encode(field).length, 0) + enc.encode(name).length;
+  if (total > MAX_FULL_TRACK_NAME_BYTES) {
+    throw new RangeError(
+      `catalog Full Track Name is ${total} bytes (namespace + catalogTrackName); `
+      + `the maximum is ${MAX_FULL_TRACK_NAME_BYTES} bytes`,
+    );
+  }
+}
+
+/** Validate configuration before opening a connection. */
 export function validateConfig(config: MoqtPlayerConfig): void {
+  if (config.catalogTrackName !== undefined) {
+    if (typeof config.catalogTrackName !== 'string') throw new TypeError('catalogTrackName must be a string');
+    assertUtf8EncodableIdentity(undefined, config.catalogTrackName);
+  }
+  assertCatalogFullTrackNameFits(config);
+  if (config.videoAltGroup !== undefined) {
+    if (!Number.isSafeInteger(config.videoAltGroup)) {
+      throw new RangeError('videoAltGroup must be a safe integer');
+    }
+    if (config.knownTracks && !config.catalog && !config.disableVideo) {
+      throw new TypeError('videoAltGroup cannot be combined with knownTracks; select from the catalog');
+    }
+  }
+  validateSelection(config);
+  if (config.audioLanguages !== undefined && !config.disableAudio) {
+    if (!Array.isArray(config.audioLanguages) || !config.audioLanguages.every(range => typeof range === 'string')) {
+      throw new TypeError('audioLanguages must be an ordered array of basic language ranges');
+    }
+    preferredLanguage([], config.audioLanguages);
+  }
+  if (config.authorization !== undefined && (!config.authorization || typeof config.authorization.getTokens !== 'function')) {
+    throw new TypeError('Invalid authorization configuration');
+  }
+  if (config.authorization && config.authTokens !== undefined) {
+    throw new TypeError('Specify authorization or authTokens, not both');
+  }
+  if (config.authorization && config.connection) {
+    throw new TypeError('Configure authorization when connecting an externally owned connection, not on its player');
+  }
   // subscriberPriority: 0–255 (§9.2.2.3)
   if (config.subscriberPriority !== undefined) {
     if (!Number.isInteger(config.subscriberPriority) || config.subscriberPriority < 0 || config.subscriberPriority > 255) {
@@ -884,4 +1090,30 @@ export function validateConfig(config: MoqtPlayerConfig): void {
       throw new RangeError(`capLevelToResolution dimensions must be > 0, got ${config.capLevelToResolution.width}x${config.capLevelToResolution.height}`);
     }
   }
+}
+
+/** Adapters owned by one frame-decoding output graph. */
+export interface FrameOutputAdapters {
+  readonly videoDecoder?: VideoDecoderLike;
+  readonly renderer?: VideoRendererLike;
+  readonly audioDecoder?: AudioDecoderLike;
+  readonly audioOutput?: AudioOutputLike;
+}
+
+export interface FrameOutputContext {
+  /** Replace only video, preserving the current audio graph; absent means whole-output adoption. */
+  readonly scope?: 'video';
+  readonly video: boolean;
+  readonly audio: boolean;
+  readonly clock: ClockSource;
+}
+
+/** A fresh, initially inactive graph for preparing a frame-mode seek. */
+export interface FrameOutput extends FrameOutputAdapters {
+  /** Must acknowledge a video-only request before its adoption callback may run. */
+  readonly scope?: 'video';
+  /** Synchronously update the embedding's output pointer after adoption; Promise returns are refused. */
+  readonly onAdopt?: (state: Readonly<{ playing: boolean }>) => void;
+  /** Synchronously release that pointer after retirement, including a throwing onAdopt. */
+  readonly onRetire?: () => void;
 }

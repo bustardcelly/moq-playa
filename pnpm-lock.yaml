@@ -16,12 +16,18 @@ importers:
 
   .:
     devDependencies:
+      '@openmoq/transport':
+        specifier: workspace:*
+        version: link:packages/transport
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.13
       fast-check:
         specifier: ^4.9.0
         version: 4.9.0
+      playwright:
+        specifier: 1.62.1
+        version: 1.62.1
       tsup:
         specifier: ^8.5.1
         version: 8.5.1(postcss@8.5.23)(tsx@4.23.13)(typescript@5.9.3)
@@ -64,6 +70,9 @@ importers:
       '@openmoq/msf':
         specifier: workspace:*
         version: link:../packages/msf
+      '@openmoq/playa':
+        specifier: workspace:*
+        version: link:../packages/playa
       '@openmoq/playback':
         specifier: workspace:*
         version: link:../packages/playback
@@ -76,9 +85,6 @@ importers:
       '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../packages/webtransport
-      '@openmoq/playa':
-        specifier: workspace:*
-        version: link:../packages/playa
     devDependencies:
       vite:
         specifier: ^6.4.3
@@ -161,6 +167,99 @@ importers:
         specifier: workspace:*
         version: link:../webtransport
 
+  packages/compat-browser:
+    dependencies:
+      '@openmoq/browser':
+        specifier: workspace:*
+        version: link:../browser
+
+  packages/compat-loc:
+    dependencies:
+      '@openmoq/loc':
+        specifier: workspace:*
+        version: link:../loc
+
+  packages/compat-locmaf:
+    dependencies:
+      '@openmoq/locmaf':
+        specifier: workspace:*
+        version: link:../locmaf
+
+  packages/compat-msf:
+    dependencies:
+      '@openmoq/msf':
+        specifier: workspace:*
+        version: link:../msf
+
+  packages/compat-playa:
+    dependencies:
+      '@openmoq/playa':
+        specifier: workspace:*
+        version: link:../playa
+
+  packages/compat-playback:
+    dependencies:
+      '@openmoq/playback':
+        specifier: workspace:*
+        version: link:../playback
+
+  packages/compat-player:
+    dependencies:
+      '@openmoq/player':
+        specifier: workspace:*
+        version: link:../player
+
+  packages/compat-quic:
+    dependencies:
+      '@openmoq/quic':
+        specifier: workspace:*
+        version: link:../quic
+
+  packages/compat-transport:
+    dependencies:
+      '@openmoq/transport':
+        specifier: workspace:*
+        version: link:../transport
+
+  packages/compat-webtransport:
+    dependencies:
+      '@openmoq/webtransport':
+        specifier: workspace:*
+        version: link:../webtransport
+
+  packages/devtools:
+    dependencies:
+      '@openmoq/devtools-protocol':
+        specifier: workspace:*
+        version: link:../devtools-protocol
+      '@openmoq/transport':
+        specifier: workspace:*
+        version: link:../transport
+    devDependencies:
+      '@openmoq/player':
+        specifier: workspace:*
+        version: link:../player
+      '@openmoq/webtransport':
+        specifier: workspace:*
+        version: link:../webtransport
+
+  packages/devtools-probe:
+    dependencies:
+      '@openmoq/devtools':
+        specifier: workspace:*
+        version: link:../devtools
+      '@openmoq/devtools-protocol':
+        specifier: workspace:*
+        version: link:../devtools-protocol
+      '@openmoq/transport':
+        specifier: workspace:*
+        version: link:../transport
+      '@openmoq/webtransport':
+        specifier: workspace:*
+        version: link:../webtransport
+
+  packages/devtools-protocol: {}
+
   packages/loc:
     dependencies:
       '@openmoq/transport':
@@ -233,6 +332,28 @@ importers:
       '@openmoq/transport':
         specifier: workspace:*
         version: link:../transport
+
+  tools/devtools-extension:
+    dependencies:
+      '@openmoq/devtools':
+        specifier: workspace:*
+        version: link:../../packages/devtools
+      '@openmoq/devtools-probe':
+        specifier: workspace:*
+        version: link:../../packages/devtools-probe
+      '@openmoq/devtools-protocol':
+        specifier: workspace:*
+        version: link:../../packages/devtools-protocol
+    devDependencies:
+      '@openmoq/playa':
+        specifier: workspace:*
+        version: link:../../packages/playa
+      esbuild:
+        specifier: 0.28.1
+        version: 0.28.1
+      vitest:
+        specifier: ^3.2.0
+        version: 3.2.7(@types/debug@4.1.13)(@types/node@22.19.13)(tsx@4.23.13)
 
 packages:
 
@@ -782,6 +903,11 @@ packages:
     resolution: {integrity: sha512-eKpRKAovdpZtR1WopLHxlBWvAgPny3c4gX1G5Jhwmmw4XJj0ifSD5qB5TOo8hmA0wlRKDAOAhEE1yVPgs6Fgcg==}
     engines: {node: '>=14.14'}
 
+  fsevents@2.3.2:
+    resolution: {integrity: sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==}
+    engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
+    os: [darwin]
+
   fsevents@2.3.3:
     resolution: {integrity: sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==}
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
@@ -916,6 +1042,16 @@ packages:
 
   pkg-types@1.3.1:
     resolution: {integrity: sha512-/Jm5M4RvtBFVkKWRu2BLUTNP8/M2a+UwuAX+ae4770q1qVGtfjG+WTCupoZixokjmHiry8uI+dlY8KXYV5HVVQ==}
+
+  playwright-core@1.62.1:
+    resolution: {integrity: sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw==}
+    engines: {node: '>=20'}
+    hasBin: true
+
+  playwright@1.62.1:
+    resolution: {integrity: sha512-0M+L3LAD8/nm554LOla9Ayx0j0tmFZ0FBcoQ7F1VuVHpM/XpiC8RcDzBQB8W5+hA8L22THxELzeF+2WcUzvcLg==}
+    engines: {node: '>=20'}
+    hasBin: true
 
   postcss-load-config@6.0.1:
     resolution: {integrity: sha512-oPtTM4oerL+UXmx+93ytZVN82RrlY/wPUV8IeDxFrzIjXOLF1pN+EmKPLbubvKHT2HC20xXsCAH2Z+CKV6Oz/g==}
@@ -1672,6 +1808,9 @@ snapshots:
       jsonfile: 6.2.1
       universalify: 2.0.1
 
+  fsevents@2.3.2:
+    optional: true
+
   fsevents@2.3.3:
     optional: true
 
@@ -1775,6 +1914,14 @@ snapshots:
       confbox: 0.1.8
       mlly: 1.8.2
       pathe: 2.0.3
+
+  playwright-core@1.62.1: {}
+
+  playwright@1.62.1:
+    dependencies:
+      playwright-core: 1.62.1
+    optionalDependencies:
+      fsevents: 2.3.2
 
   postcss-load-config@6.0.1(postcss@8.5.23)(tsx@4.23.13):
     dependencies:

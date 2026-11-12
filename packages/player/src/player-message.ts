@@ -23,6 +23,7 @@ import type { TrackPackaging } from './subscription-manager.js';
 /** Active subscription info stored per requestId. */
 export interface ActiveSubscription {
   trackName: string;
+  namespace?: readonly string[];
   /** Unknown until SUBSCRIBE_OK; a Request ID is never an alias. */
   trackAlias: bigint | null;
 }
@@ -48,7 +49,8 @@ export interface MessageAdapter {
 /** Minimal subscription manager interface. */
 export interface MessageSubscriptionManager {
   unregisterTrack(trackAlias: bigint): void;
-  registerTrack(trackAlias: bigint, trackName: string, mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline', packaging?: TrackPackaging): void;
+  registerTrack(trackAlias: bigint, trackName: string, mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline', packaging?: TrackPackaging,
+    identity?: { readonly sourceConnection: unknown; readonly namespace: readonly string[] }): void;
   /** Check if a track alias is already registered. */
   getMediaType(trackAlias: bigint): 'video' | 'audio' | 'mediatimeline' | 'eventtimeline' | undefined;
 }
@@ -77,6 +79,8 @@ function extractLargestLocation(parameters: Parameters | undefined): { group: bi
 }
 
 export interface ControlMessageContext {
+  sourceConnection?: unknown;
+  namespace?: readonly string[];
   /** Catalog bootstrap: SUBSCRIBE_OK largest for the catalog subscription
    *  (null = SUBSCRIBE_OK carried no LARGEST_OBJECT → track empty). */
   onCatalogSubscribeOk?: (largest: { group: bigint; object: bigint } | null) => void;
@@ -107,15 +111,16 @@ export interface ControlMessageContext {
   emitEvent: (event: Record<string, unknown>) => void;
   setCatalogTrackAlias: (alias: bigint) => void;
   clearCatalogState: () => void;
-  onGoaway: (newSessionUri: string | undefined) => void;
   /** Called when SUBSCRIBE_OK resolves an alias — replay buffered objects. */
   onAliasResolved?: (alias: bigint) => void;
   /** Called when SUBSCRIBE_OK matches a pending media subscription. @see §9.10 */
-  onMediaSubscribeOk?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio') => void;
+  onMediaSubscribeOk?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', largest: { group: bigint; object: bigint } | null) => void;
   /** Called when REQUEST_ERROR matches a pending media subscription. @see §9.8 */
-  onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint) => void;
+  onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint, retryInterval: bigint) => void;
   /** Called when PUBLISH_DONE arrives — player can re-subscribe if needed. */
   onPublishDone?: (requestId: bigint, trackName: string, trackAlias: bigint | null, statusCode: bigint, errorReason: string) => void;
+  /** Consume a media terminal while its accepted data is still draining. No default retirement/event when true. */
+  onMediaTerminalDrain?: (requestId: bigint, sub: ActiveSubscription, statusCode: bigint, reason: string) => boolean;
   /**
    * Called when REQUEST_ERROR matches a pending fetchCatalog. The
    * player layer dispatches the error to the right pending promise.
@@ -189,23 +194,12 @@ export function handleControlMessage(
     ctx.log.debug('[CTRL] %s reqId=%s%s%s', msg.type, reqStr, trackStr, extra);
   }
   switch (msg.type) {
-    case 'GOAWAY':
-      ctx.log.info('GOAWAY received, uri=%s', msg.newSessionUri ?? '(none)');
-      // §9.4 SHOULD: "A subscriber SHOULD individually UNSUBSCRIBE for
-      // each existing subscription"
-      for (const [requestId] of ctx.activeSubscriptions) {
-        ctx.adapter?.unsubscribe(varint(requestId));
-      }
-      ctx.activeSubscriptions.clear();
-
-      ctx.emitEvent({
-        type: 'session_goaway',
-        newSessionUri: msg.newSessionUri,
-      });
-
-      // §3.5, §8.4.1: Delegate migration to player
-      ctx.onGoaway(msg.newSessionUri);
-      break;
+    // GOAWAY is deliberately absent here. This dispatch cannot tell a
+    // control-stream GOAWAY (whole session) from one on a single request stream
+    // (that request only — draft-18 §10.4, draft-22 §6.6.1). The connection
+    // still delivers an accepted GOAWAY on its raw message channel, but the
+    // scope it needs arrives separately as a GoawayNotice, which the player
+    // acts on instead.
 
     case 'SUBSCRIBE_OK': {
       // §9.10: SUBSCRIBE_OK assigns the server's Track Alias for this subscription.
@@ -242,9 +236,12 @@ export function handleControlMessage(
       if (pending && active) {
         ctx.pendingMediaSubs.delete(okReqId);
         active.trackAlias = alias;
-        ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging);
+        if (ctx.sourceConnection !== undefined && (active.namespace ?? ctx.namespace) !== undefined) {
+          ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging,
+            { sourceConnection: ctx.sourceConnection, namespace: (active.namespace ?? ctx.namespace)! });
+        } else ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging);
         if (pending.mediaType === 'video' || pending.mediaType === 'audio') {
-          ctx.onMediaSubscribeOk?.(okReqId, pending.trackName, pending.mediaType);
+          ctx.onMediaSubscribeOk?.(okReqId, pending.trackName, pending.mediaType, extractLargestLocation(msg.parameters as Parameters | undefined));
         }
         ctx.onMediaAliasBound?.(okReqId, alias);
         // Replay objects that arrived before this alias was resolved
@@ -289,6 +286,7 @@ export function handleControlMessage(
       ctx.log.debug('PUBLISH_DONE reqId=%s sub=%s', doneReqId, sub ? sub.trackName : '(none)');
       if (sub) {
         ctx.log.info('PUBLISH_DONE "%s": %s', sub.trackName, msg.errorReason ?? '(no reason)');
+        if (ctx.onMediaTerminalDrain?.(doneReqId, sub, BigInt(msg.statusCode), msg.errorReason ?? '')) break;
         ctx.removeSubscription(doneReqId);
 
         // Let the player re-subscribe if this is a track we still want
@@ -353,7 +351,7 @@ export function handleControlMessage(
         ctx.removeSubscription(errReqId);
         if (pendingMedia.mediaType === 'video' || pendingMedia.mediaType === 'audio') {
           ctx.onMediaSubscribeError?.(errReqId, pendingMedia.trackName, pendingMedia.mediaType,
-            msg.errorReason ?? '', BigInt(msg.errorCode));
+            msg.errorReason ?? '', BigInt(msg.errorCode), msg.retryInterval);
         }
       }
 

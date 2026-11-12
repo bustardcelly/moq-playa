@@ -9,7 +9,7 @@
  * @module
  */
 
-import type { AudioOutputLike } from '@openmoq/player';
+import type { AudioOutputLike, AudioScheduleObservation, AudioScheduleObserver, AudioScheduleReason, AudioProducedTiming, AudioSourcePosition } from '@openmoq/player';
 import type { ClockSource } from '@openmoq/playback';
 
 
@@ -27,6 +27,7 @@ import type { ClockSource } from '@openmoq/playback';
  * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for sync)
  */
 export class WebAudioOutput implements AudioOutputLike {
+  readonly supportsOutputTiming = true as const;
   private readonly audioCtx: AudioContext;
 
   /**
@@ -40,24 +41,72 @@ export class WebAudioOutput implements AudioOutputLike {
    * Next scheduled playout time in AudioContext.currentTime units.
    * Tracks the end of the last scheduled buffer for seamless playback.
    */
-  private nextScheduledTime = 0;
+  private nextScheduledTime: number | null = null;
 
   /** Active source nodes — tracked for flush/destroy. */
   private readonly activeSources: AudioBufferSourceNode[] = [];
+  private destroyed = false;
+  private scheduleRevision = 0;
+  private scheduleObservers: Set<AudioScheduleObserver> | undefined;
+  // No PCM or source history: only observed, currently owned source nodes.
+  private scheduleTokens: WeakMap<AudioBufferSourceNode, object> | undefined;
 
   /**
-   * Scheduled-buffer ring for playhead observability: which capture
-   * timestamp is coming out of the speakers right now. One entry per
-   * scheduled buffer; pruned lazily once playout passes a buffer's end.
-   * `captureUs` is the decoded AudioData.timestamp — WebCodecs preserves
-   * the EncodedAudioChunk timestamp, which LOC sets to CaptureTimestamp.
+   * No pre-attachment history. Detach suppresses events without stopping media.
+   * Released means the node ended, never proof of audible output. While an
+   * AudioContext is suspended, a scheduled node may remain pending indefinitely.
+   */
+  observeSchedules(observer: AudioScheduleObserver): () => void {
+    if (typeof observer !== 'function') throw new TypeError('Expected a schedule observer');
+    const listeners = this.scheduleObservers ??= new Set();
+    const member: AudioScheduleObserver = event => observer(event);
+    listeners.add(member);
+    return () => {
+      listeners.delete(member);
+      if (this.scheduleObservers === listeners && listeners.size === 0) this.scheduleObservers = undefined;
+    };
+  }
+
+  private observeSchedule(token: object, state: AudioScheduleObservation['state'], reason: AudioScheduleReason | null,
+      stillScheduled?: () => boolean): void {
+    const listeners = this.scheduleObservers;
+    if (!listeners) return;
+    for (const listener of [...listeners]) {
+      if (this.scheduleObservers !== listeners || !listeners.has(listener)) continue;
+      if (stillScheduled && !stillScheduled()) break;
+      try { const pending = listener({ token, state, reason }); if (pending) void Promise.resolve(pending).catch(() => {}); }
+      catch { /* Optional observations cannot interrupt scheduling. */ }
+    }
+  }
+
+  private finishSource(source: AudioBufferSourceNode, state: 'released' | 'discarded', reason: AudioScheduleReason | null): void {
+    const idx = this.activeSources.indexOf(source);
+    if (idx !== -1) this.activeSources.splice(idx, 1);
+    if (this.hasOwnedSources) {
+      for (const entry of this.scheduledRing) if (entry.source === source) entry.ended = true;
+    }
+    const token = this.scheduleTokens?.get(source);
+    this.scheduleTokens?.delete(source);
+    if (token !== undefined) this.observeSchedule(token, state, reason);
+  }
+
+  /**
+   * One entry per scheduled buffer, pruned once graph time passes its end.
+   * Unarmed captureUs preserves the legacy native-timestamp diagnostic.
+   * Armed entries use producing evidence instead: native AAC timestamps can
+   * diverge from source time, so that diagnostic is unavailable there.
    */
   private readonly scheduledRing: Array<{
-    captureUs: number;
+    captureUs: number | null;
     startSec: number;
     durSec: number;
     rate: number;
+    outputTiming?: AudioProducedTiming;
+    sourceOffsetUs?: number;
+    source?: AudioBufferSourceNode;
+    ended?: boolean;
   }> = [];
+  private hasOwnedSources = false;
 
   /** Current playback rate for live catch-up. @see draft-ietf-moq-msf-00 §5.1.16 */
   private _playbackRate = 1.0;
@@ -112,74 +161,199 @@ export class WebAudioOutput implements AudioOutputLike {
    *
    * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for A/V sync)
    */
-  schedule(data: unknown, renderTimeUs: number): void {
+  schedule(data: unknown, renderTimeUs: number, inputToken?: object, outputTiming?: AudioProducedTiming | null): void {
     const audioData = data as AudioData;
-
-    // Copy decoded PCM into an AudioBuffer.
-    // AudioData holds native memory — close() is required.
-    const buf = this.audioCtx.createBuffer(
-      audioData.numberOfChannels,
-      audioData.numberOfFrames,
-      audioData.sampleRate,
-    );
-
-    for (let ch = 0; ch < audioData.numberOfChannels; ch++) {
-      const dest = buf.getChannelData(ch);
-      audioData.copyTo(dest, { planeIndex: ch, format: 'f32-planar' });
+    const token = this.scheduleObservers && inputToken !== undefined ? inputToken : undefined;
+    if (this.destroyed) {
+      try { audioData.close(); }
+      finally { if (token !== undefined) this.observeSchedule(token, 'discarded', 'destroyed'); }
+      return;
     }
-    // Capture timeline position of this buffer — read BEFORE close().
-    const captureUs = audioData.timestamp;
-    audioData.close();
+    const revision = this.scheduleRevision;
+    let trimFrames = 0;
+    let sourceOffsetUs = 0;
+    if (outputTiming !== undefined) {
+      if (!outputTiming || typeof outputTiming.context.sourceTimestampUs !== 'bigint'
+          || typeof outputTiming.context.presentFromSourceUs !== 'bigint'
+          || !Number.isSafeInteger(outputTiming.sourceOffsetUs) || outputTiming.sourceOffsetUs < 0
+          || !Number.isSafeInteger(audioData.sampleRate) || audioData.sampleRate <= 0
+          || !Number.isSafeInteger(audioData.numberOfFrames) || audioData.numberOfFrames <= 0
+          || !Number.isFinite(this._playbackRate) || this._playbackRate <= 0) {
+        this.discardData(audioData, token, 'timing unavailable'); return;
+      }
+      // Exact ceil on the PCM grid. Never convert an absolute source point, or
+      // an out-of-buffer frame count, to Number.
+      const delta = outputTiming.context.presentFromSourceUs - outputTiming.context.sourceTimestampUs - BigInt(outputTiming.sourceOffsetUs);
+      const numerator = delta * BigInt(audioData.sampleRate);
+      const k = numerator <= 0n ? 0n : (numerator + 999_999n) / 1_000_000n;
+      if (k >= BigInt(audioData.numberOfFrames)) { this.discardData(audioData, token, 'preroll'); return; }
+      trimFrames = Number(k);
+      sourceOffsetUs = outputTiming.sourceOffsetUs + trimFrames * 1_000_000 / audioData.sampleRate;
+      const time = this.sourceRenderTime(outputTiming, sourceOffsetUs);
+      if (time === null || this.destroyed || this.scheduleRevision !== revision) {
+        this.discardData(audioData, token, 'timing unavailable'); return;
+      }
+      renderTimeUs = time;
+    }
+    let source: AudioBufferSourceNode | undefined;
+    let registered = false;
+    try {
+      let buf: AudioBuffer;
+      let captureUs: number | null;
+      try {
+        // Copy decoded PCM into an AudioBuffer.
+        // AudioData holds native memory — close() is required.
+        buf = this.audioCtx.createBuffer(
+          audioData.numberOfChannels,
+          audioData.numberOfFrames - trimFrames,
+          audioData.sampleRate,
+        );
 
+        for (let ch = 0; ch < audioData.numberOfChannels; ch++) {
+          const dest = buf.getChannelData(ch);
+          if (outputTiming === undefined) audioData.copyTo(dest, { planeIndex: ch, format: 'f32-planar' });
+          else audioData.copyTo(dest, { planeIndex: ch, format: 'f32-planar', frameOffset: trimFrames, frameCount: audioData.numberOfFrames - trimFrames });
+        }
+        // Capture timeline position of this buffer — read BEFORE close().
+        captureUs = outputTiming === undefined ? audioData.timestamp : null;
+      } finally { audioData.close(); }
+      if (this.destroyed || this.scheduleRevision !== revision) {
+        if (token !== undefined) this.observeSchedule(token, 'discarded', this.destroyed ? 'destroyed' : 'flushed');
+        return;
+      }
+
+      if (outputTiming) {
+        const time = this.sourceRenderTime(outputTiming, sourceOffsetUs);
+        if (time === null || this.destroyed || this.scheduleRevision !== revision) {
+          if (token !== undefined) this.observeSchedule(token, 'discarded', 'timing unavailable');
+          return;
+        }
+        renderTimeUs = time;
+      }
+
+      const now = this.audioCtx.currentTime;
+
+      // Audio scheduling strategy:
+      // - Normal playback: chain back-to-back (nextScheduledTime) for
+      //   seamless, gap-free audio. Using targetTime per-sample causes
+      //   drift when samples arrive in bursts from the jitter buffer.
+      // - After stall/gap: snap to sync-aligned targetTime to re-sync
+      //   with video (nextScheduledTime is in the past).
+      // - playbackDelaySec matches the video output delay so both media
+      //   types start at the same wall-clock offset.
+      let startTime: number;
+      if (this.nextScheduledTime !== null && this.nextScheduledTime >= now) {
+        // Normal playback — back-to-back for seamless audio
+        startTime = this.nextScheduledTime;
+      } else if (renderTimeUs > 0) {
+        // After stall — jump to sync-aligned position + playback delay
+        startTime = Math.max(this.toAudioCtxTime(renderTimeUs) + this.playbackDelaySec, now);
+      } else {
+        // No render time (sync not established) — start from now + delay
+        startTime = now + this.playbackDelaySec;
+      }
+
+      // Schedule for playout.
+      source = this.audioCtx.createBufferSource();
+      const owned = source;
+      source.buffer = buf;
+      const scheduledRate = this._playbackRate;
+      source.playbackRate.value = scheduledRate;
+      // Own the source before calling start: wrappers may synchronously stop or end it.
+      this.activeSources.push(source);
+      registered = true;
+      if (token !== undefined) (this.scheduleTokens ??= new WeakMap()).set(source, token);
+      let starting = true;
+      let ended = false;
+      source.onended = () => {
+        if (starting) { ended = true; return; }
+        this.finishSource(owned, 'released', null);
+      };
+      source.connect(this.destination);
+      if (this.destroyed || this.scheduleRevision !== revision) {
+        this.finishSource(source, 'discarded', this.destroyed ? 'destroyed' : 'flushed');
+        try { source.stop(); } catch { /* Not started. */ }
+        try { source.disconnect(); } catch { /* Already disconnected. */ }
+        return;
+      }
+      if (outputTiming && this.sourceRenderTime(outputTiming, sourceOffsetUs) === null) {
+        this.finishSource(source, 'discarded', 'timing unavailable');
+        try { source.disconnect(); } catch { /* Not started. */ }
+        return;
+      }
+      // A reentrant cancellation already consumed this source and its terminal.
+      if (!this.activeSources.includes(source)) return;
+      // Source setup and timing callbacks may advance the audio clock. A past
+      // start plays the whole buffer immediately, so chain from this fresh time.
+      startTime = Math.max(startTime, this.audioCtx.currentTime);
+      if (this.destroyed || this.scheduleRevision !== revision || !this.activeSources.includes(source)) return;
+      source.start(startTime);
+      starting = false;
+      if (this.destroyed || this.scheduleRevision !== revision || !this.activeSources.includes(source)) return;
+      if (outputTiming && this.sourceRenderTime(outputTiming, sourceOffsetUs) === null) {
+        this.finishSource(source, 'discarded', 'timing unavailable');
+        try { source.stop(); } catch { /* May already have ended. */ }
+        try { source.disconnect(); } catch { /* Already disconnected. */ }
+        return;
+      }
+      if (this.destroyed || this.scheduleRevision !== revision || !this.activeSources.includes(source)) return;
+      // Commit timeline state before notifying; reentrant flush must remain authoritative.
+      const rate = outputTiming ? scheduledRate : this._playbackRate;
+      this.nextScheduledTime = startTime + buf.duration / rate;
+      const entry: (typeof this.scheduledRing)[number] = { captureUs, startSec: startTime, durSec: buf.duration / rate, rate };
+      if (outputTiming) {
+        entry.outputTiming = outputTiming; entry.sourceOffsetUs = sourceOffsetUs; entry.source = source;
+        this.hasOwnedSources = true;
+      }
+      this.scheduledRing.push(entry);
+      if (token !== undefined) this.observeSchedule(token, 'scheduled', null, () => this.scheduleTokens?.get(owned) === token);
+      if (ended) this.finishSource(source, 'released', null);
+    } catch (error) {
+      if (source) {
+        this.finishSource(source, 'discarded', 'schedule failed');
+        if (outputTiming) { try { source.stop(); } catch { /* Preserve the scheduling error. */ } }
+        try { source.disconnect(); } catch { /* Preserve the scheduling error. */ }
+      }
+      if (!registered && token !== undefined) this.observeSchedule(token, 'discarded', 'schedule failed');
+      throw error;
+    }
+  }
+
+  private discardData(data: AudioData, token: object | undefined, reason: AudioScheduleReason): void {
+    try { data.close(); }
+    finally { if (token !== undefined) this.observeSchedule(token, 'discarded', reason); }
+  }
+
+  private sourceRenderTime(timing: AudioProducedTiming, offset: number): number | null {
+    if (!Number.isFinite(offset) || Math.abs(offset) > Number.MAX_SAFE_INTEGER) return null;
+    try {
+      const time = timing.context.recomputeRenderTimeUs(offset);
+      return typeof time === 'number' && Number.isFinite(time) ? time : null;
+    } catch { return null; }
+  }
+
+  /** Current occupied source interval; scheduled/future data is not a witness. */
+  sampleSourcePosition(epoch: object): AudioSourcePosition | null {
+    const revision = this.scheduleRevision;
+    // Suspended/closed contexts may retain scheduled nodes at a frozen clock,
+    // but Web Audio processing is stopped: that is not a played-source head.
+    if (this.audioCtx.state !== 'running' || this.destroyed || this.scheduleRevision !== revision) return null;
     const now = this.audioCtx.currentTime;
-
-    // Audio scheduling strategy:
-    // - Normal playback: chain back-to-back (nextScheduledTime) for
-    //   seamless, gap-free audio. Using targetTime per-sample causes
-    //   drift when samples arrive in bursts from the jitter buffer.
-    // - After stall/gap: snap to sync-aligned targetTime to re-sync
-    //   with video (nextScheduledTime is in the past).
-    // - playbackDelaySec matches the video output delay so both media
-    //   types start at the same wall-clock offset.
-    let startTime: number;
-    if (this.nextScheduledTime >= now) {
-      // Normal playback — back-to-back for seamless audio
-      startTime = this.nextScheduledTime;
-    } else if (renderTimeUs > 0) {
-      // After stall — jump to sync-aligned position + playback delay
-      startTime = Math.max(this.toAudioCtxTime(renderTimeUs) + this.playbackDelaySec, now);
-    } else {
-      // No render time (sync not established) — start from now + delay
-      startTime = now + this.playbackDelaySec;
+    let firstLive = 0;
+    while (firstLive < this.scheduledRing.length) {
+      const entry = this.scheduledRing[firstLive]!;
+      if (!entry.ended && now < entry.startSec + entry.durSec) break;
+      firstLive++;
     }
-
-    // Schedule for playout.
-    const source = this.audioCtx.createBufferSource();
-    source.buffer = buf;
-    // Apply catch-up playback rate (>1.0 = faster playout).
-    // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
-    source.playbackRate.value = this._playbackRate;
-    source.connect(this.destination);
-    source.start(startTime);
-    // Duration at adjusted rate — faster playout means shorter wall-clock time.
-    this.nextScheduledTime = startTime + buf.duration / this._playbackRate;
-
-    // Playhead observability (no scheduling effect): record what was
-    // scheduled where, so playheadCaptureUs() can answer "what capture
-    // timestamp is being heard right now."
-    this.scheduledRing.push({
-      captureUs,
-      startSec: startTime,
-      durSec: buf.duration / this._playbackRate,
-      rate: this._playbackRate,
-    });
-
-    // Track for flush/destroy cleanup
-    this.activeSources.push(source);
-    source.onended = () => {
-      const idx = this.activeSources.indexOf(source);
-      if (idx !== -1) this.activeSources.splice(idx, 1);
-    };
+    if (firstLive > 0) this.scheduledRing.splice(0, firstLive);
+    const playing = this.scheduledRing[0];
+    const timing = playing?.outputTiming;
+    if (!playing || now < playing.startSec || !timing || timing.context.epoch !== epoch
+        || playing.sourceOffsetUs === undefined || this.sourceRenderTime(timing, playing.sourceOffsetUs) === null
+        || this.audioCtx.state !== 'running' || this.destroyed || this.scheduleRevision !== revision || playing.ended) return null;
+    const offset = playing.sourceOffsetUs + (now - playing.startSec) * playing.rate * 1_000_000;
+    if (!Number.isFinite(offset) || Math.abs(offset) > Number.MAX_SAFE_INTEGER) return null;
+    return { epoch, sourceTimestampUs: timing.context.sourceTimestampUs, sourceOffsetUs: offset };
   }
 
   /**
@@ -216,24 +390,32 @@ export class WebAudioOutput implements AudioOutputLike {
     if (firstLive > 0) this.scheduledRing.splice(0, firstLive);
 
     const playing = this.scheduledRing[0];
-    if (!playing || now < playing.startSec) return null; // silent: starved or not yet started
+    if (!playing || now < playing.startSec || playing.captureUs === null) return null; // silent: starved or not yet started
     const intoBufferSec = now - playing.startSec;
     return playing.captureUs + intoBufferSec * playing.rate * 1_000_000;
   }
 
   /** Cancel all scheduled audio. */
   flush(): void {
-    for (const source of this.activeSources) {
-      try {
-        source.stop();
-        source.disconnect();
-      } catch {
-        // Already stopped or disconnected
-      }
-    }
-    this.activeSources.length = 0;
+    this.scheduleRevision++;
+    const sources = this.activeSources.splice(0);
     this.scheduledRing.length = 0;
-    this.nextScheduledTime = 0;
+    this.hasOwnedSources = false;
+    this.nextScheduledTime = null;
+    // Detach ALL token ownership before stop/onended or observers can reenter.
+    const tokens = sources.map(source => {
+      const token = this.scheduleTokens?.get(source);
+      this.scheduleTokens?.delete(source);
+      return token;
+    });
+    const reason = this.destroyed ? 'destroyed' : 'flushed';
+    for (let i = 0; i < sources.length; i++) {
+      const source = sources[i]!;
+      try { source.stop(); } catch { /* Already stopped or not started. */ }
+      try { source.disconnect(); } catch { /* Already disconnected. */ }
+      const token = tokens[i];
+      if (token !== undefined) this.observeSchedule(token, 'discarded', reason);
+    }
   }
 
   /**
@@ -246,6 +428,7 @@ export class WebAudioOutput implements AudioOutputLike {
 
   /** Release resources. */
   destroy(): void {
+    this.destroyed = true;
     this.flush();
   }
 }

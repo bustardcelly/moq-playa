@@ -2851,19 +2851,13 @@ describe('Session', () => {
         expect(close.error).toBe(SessionErrorCode.INVALID_REQUEST_ID);
       });
 
-      it('validates incoming request IDs are sequential', () => {
-        // First request OK: ID=0
-        session.handleControlMessage(incomingSubscribe(0n));
-
-        // Second request should be ID=2, not ID=4
-        const actions = session.handleControlMessage({
-          ...incomingSubscribe(4n),
-          requestId: varint(4n),
-        });
-
-        expect(actions.length).toBe(1);
-        const close = actions[0] as CloseConnectionAction;
-        expect(close.error).toBe(SessionErrorCode.INVALID_REQUEST_ID);
+      it('accepts reordered incoming request IDs but rejects reuse', () => {
+        for (const id of [0n, 4n, 2n]) {
+          expect(session.handleControlMessage(incomingSubscribe(id))).not.toContainEqual(
+            expect.objectContaining({ type: 'close_connection' }));
+        }
+        expect(session.handleControlMessage(incomingSubscribe(4n))).toContainEqual(
+          expect.objectContaining({ type: 'close_connection', error: SessionErrorCode.INVALID_REQUEST_ID }));
       });
 
       it('rejects request ID exceeding our MAX_REQUEST_ID', () => {
@@ -6097,7 +6091,7 @@ describe('acceptFetch options (draft-18 §10.13)', () => {
     expect(fetchOk.endLocation).toEqual({ group: big, object: big + 1n });
   });
 
-  it('acceptFetch defaults to endOfTrack 0 + {0,0} when no options are given', () => {
+  it('acceptFetch defaults to endOfTrack 0 and the known requested coverage', () => {
     const s = established18();
     s.handleControlMessage({
       type: 'FETCH', requestId: 1n,
@@ -6107,7 +6101,7 @@ describe('acceptFetch options (draft-18 §10.13)', () => {
     const actions = s.acceptFetch(1n);
     const fetchOk = (actions[0] as SendControlAction).message as { endOfTrack: number; endLocation: { group: bigint; object: bigint } };
     expect(fetchOk.endOfTrack).toBe(0);
-    expect(fetchOk.endLocation).toEqual({ group: 0n, object: 0n });
+    expect(fetchOk.endLocation).toEqual({ group: 9n, object: 0n });
   });
 });
 

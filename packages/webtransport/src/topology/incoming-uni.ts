@@ -38,6 +38,12 @@ export interface IncomingUniHandlers {
   onViolation(reason: string, error: Error): void;
   /** Surface failure of the transport's stream-accept channel unchanged. */
   onTransportError(error: Error): void;
+  /**
+   * A classifier read delivered `bytes` on `reader`. Its bytes after the stream
+   * type all belong to the final classifier read, which is what lets an owner
+   * time the first data bytes of a prefix honestly. Must not throw.
+   */
+  onRead?(reader: ReadableStreamDefaultReader<Uint8Array>, bytes: number): void;
 }
 
 export interface IncomingUniRouterOptions {
@@ -74,6 +80,7 @@ export class IncomingUniRouter {
   private setupAccepted = false;
   private dataReleased = false;
   private terminal = false;
+  private releaseStreamReaders = false;
   private started = false;
 
   constructor(
@@ -120,17 +127,25 @@ export class IncomingUniRouter {
    * Stop locally-owned work while leaving the aggregate source to transport
    * shutdown. The transport owns that readable's terminal transition; cancelling
    * it here can race a backend that closes the same controller from onClose.
+   * Graceful transport shutdown also releases child readers: an incomplete
+   * stream type may still identify a control stream.
    */
-  retire(reason: unknown): void {
-    this.stop(reason, false);
+  retire(reason: unknown, options: { graceful?: boolean } = {}): void {
+    this.stop(reason, false, options.graceful === true);
   }
 
-  private stop(reason: unknown, cancelSource: boolean): void {
+  private stop(reason: unknown, cancelSource: boolean, releaseReaders = false): void {
     if (this.terminal) return;
     const error = reason instanceof Error ? reason : new Error(String(reason));
     this.terminal = true;
+    this.releaseStreamReaders = releaseReaders;
     this.setup.reject(error);
-    this.cancelOwnedReaders(error);
+    this.retireOwnedReaders(error);
+    if (releaseReaders) {
+      // A partial stream type may still be SETUP. A clean transport close owns
+      // its termination, as well as the aggregate source's terminal transition.
+      try { this.sourceReader?.releaseLock(); } catch { /* already released */ }
+    }
     if (cancelSource) {
       try { void this.sourceReader?.cancel(error).catch(() => {}); } catch { /* transport already closed */ }
     }
@@ -147,7 +162,7 @@ export class IncomingUniRouter {
           return;
         }
         if (this.terminal) {
-          void stream.cancel().catch(() => {});
+          if (!this.releaseStreamReaders) void stream.cancel().catch(() => {});
           continue;
         }
         if (this.activeClassifiers + this.earlyData.length >= this.maxPendingStreams) {
@@ -169,9 +184,11 @@ export class IncomingUniRouter {
     const reader = stream.getReader();
     this.classifyingReaders.add(reader);
     try {
-      const classified = await classifyIncomingStream(reader);
+      const classified = await classifyIncomingStream(reader, this.handlers.onRead);
       if (this.terminal) {
-        cancelAndRelease(classified.reader);
+        if (this.releaseStreamReaders) {
+          try { classified.reader.releaseLock(); } catch { /* already released */ }
+        } else cancelAndRelease(classified.reader);
         return;
       }
       if (classified.kind === 'setup') {
@@ -239,12 +256,18 @@ export class IncomingUniRouter {
     this.handlers.onViolation(reason, error);
   }
 
-  private cancelOwnedReaders(reason: Error): void {
+  private retireOwnedReaders(reason: Error): void {
     for (const reader of this.classifyingReaders) {
-      try { void reader.cancel(reason).catch(() => {}); } catch { /* stream already closed */ }
+      try {
+        if (this.releaseStreamReaders) reader.releaseLock();
+        else void reader.cancel(reason).catch(() => {});
+      } catch { /* stream already closed or released */ }
     }
     for (const stream of this.earlyData.splice(0)) {
-      try { void stream.reader.cancel(reason).catch(() => {}); } catch { /* stream already closed */ }
+      try {
+        if (this.releaseStreamReaders) stream.reader.releaseLock();
+        else void stream.reader.cancel(reason).catch(() => {});
+      } catch { /* stream already closed or released */ }
     }
   }
 }
@@ -252,6 +275,7 @@ export class IncomingUniRouter {
 /** Read enough bytes to classify a vi64 stream type, then replay every byte. */
 async function classifyIncomingStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
+  onRead?: (reader: ReadableStreamDefaultReader<Uint8Array>, bytes: number) => void,
 ): Promise<ClassifiedStream> {
   const codec = createDataCodec(18);
   let prefix: Uint8Array = new Uint8Array(0);
@@ -276,6 +300,7 @@ async function classifyIncomingStream(
             : 'unidirectional stream FIN received mid-type',
         );
       }
+      onRead?.(reader, value.length);
       prefix = append(prefix, value);
       try {
         const kind = codec.classifyStream(prefix, 0);

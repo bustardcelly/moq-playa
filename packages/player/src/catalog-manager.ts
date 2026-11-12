@@ -20,6 +20,7 @@
  */
 
 import type { CatalogState } from '@openmoq/msf';
+import type { CatalogNamespaceContext } from '@openmoq/msf';
 import {
     parseMsfCatalog,
     parseDeltaUpdate,
@@ -35,13 +36,17 @@ import {
  */
 export class CatalogManager {
     /**
-     * Catalog namespace — used for namespace inheritance (§5.1.10).
-     * Tracks without explicit namespace inherit this value.
+     * The namespace this catalog was retrieved under, as the CONTEXT the
+     * parsers resolve against (§5.1.10 / msf-01 §5.2.2): a tuple is used
+     * verbatim, a string is catalog text. Joining a tuple into text here
+     * would re-split `['live/show']` into two fields and make it a different
+     * wire namespace from the one the player subscribes on.
      */
-    private readonly catalogNamespace: string;
+    private readonly catalogNamespace: CatalogNamespaceContext;
 
     /** Current materialized catalog state. Null until first catalog received. */
     private state: CatalogState | null = null;
+    private _wireFormat: 'msf-00' | 'msf-01' | 'catalogformat-01' | null = null;
 
     /** Number of catalog objects processed. */
     private _objectCount = 0;
@@ -65,7 +70,7 @@ export class CatalogManager {
     /** Last applied location (location-aware path only). */
     private _lastApplied: { group: bigint; object: bigint } | null = null;
 
-    constructor(catalogNamespace: string) {
+    constructor(catalogNamespace: CatalogNamespaceContext) {
         this.catalogNamespace = catalogNamespace;
     }
 
@@ -73,6 +78,9 @@ export class CatalogManager {
     get currentState(): CatalogState | null {
         return this.state;
     }
+
+    /** Last accepted independent format; normalized version 1 does not identify its wire dialect. */
+    get wireFormat() { return this._wireFormat; }
 
     /** Number of catalog objects processed. */
     get objectCount(): number {
@@ -98,6 +106,7 @@ export class CatalogManager {
      */
     reset(): void {
         this.state = null;
+        this._wireFormat = null;
         this._objectCount = 0;
         this.cf01DeltaSupport = false;
         this.lastRawDocument = null;
@@ -274,6 +283,7 @@ export class CatalogManager {
                     version: result.catalog.version,
                     tracks: [...result.catalog.tracks],
                 };
+                this._wireFormat = 'catalogformat-01';
             } else {
                 // MSF-00
                 const catalog = parseMsfCatalog(payload, this.catalogNamespace);
@@ -302,6 +312,7 @@ export class CatalogManager {
                         ? { publishTracks: catalog.publishTracks }
                         : {}),
                 };
+                this._wireFormat = typeof obj['version'] === 'number' ? 'msf-00' : 'msf-01';
             }
         }
 

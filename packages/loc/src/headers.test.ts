@@ -19,6 +19,7 @@ import {
     encodeLocHeaders,
     toVideoChunkInit,
     toAudioChunkInit,
+    locWireProfileForDraft,
 } from './headers.js';
 import { LocExtensionId } from './types.js';
 import type { LocHeaders } from './types.js';
@@ -68,6 +69,16 @@ function buildExtensionBytes(
 }
 
 // ─── parseLocHeaders ──────────────────────────────────────────────────
+
+describe('locWireProfileForDraft', () => {
+  it('maps each wired draft to its property wire profile', () => {
+    expect(locWireProfileForDraft(14)).toBe('d14-absolute-varint');
+    expect(locWireProfileForDraft(16)).toBe('d16-delta-varint');
+    expect(locWireProfileForDraft(18)).toBe('d18-delta-vi64');
+    // draft 22 keeps draft 18's vi64 Object Properties encoding
+    expect(locWireProfileForDraft(22)).toBe('d18-delta-vi64');
+  });
+});
 
 describe('parseLocHeaders', () => {
     it('returns empty headers for undefined extensions (§2.3)', () => {
@@ -428,6 +439,12 @@ describe('encodeLocHeaders with absolute type IDs (draft-14 §1.4.2)', () => {
 // ─── toVideoChunkInit ──────────────────────────────────────────────────
 
 describe('toVideoChunkInit', () => {
+    it('preserves supplied duration in microseconds, including zero', () => {
+        for (const duration of [0, 33344, 50078]) {
+            expect(toVideoChunkInit(new Uint8Array(1), { captureTimestamp: 1010000n, duration }).duration).toBe(duration);
+        }
+        expect(toVideoChunkInit(new Uint8Array(1), {})).not.toHaveProperty('duration');
+    });
     it('creates key chunk for independent frame (§2.3.2.2)', () => {
         const payload = new Uint8Array([0x00, 0x00, 0x01, 0x67]);
         const headers: LocHeaders = {
@@ -486,6 +503,12 @@ describe('toVideoChunkInit', () => {
 // ─── toAudioChunkInit ──────────────────────────────────────────────────
 
 describe('toAudioChunkInit', () => {
+    it('preserves supplied duration in microseconds, including zero', () => {
+        for (const duration of [0, 62521, 93896]) {
+            expect(toAudioChunkInit(new Uint8Array(1), { captureTimestamp: 1010000n, duration }).duration).toBe(duration);
+        }
+        expect(toAudioChunkInit(new Uint8Array(1), {})).not.toHaveProperty('duration');
+    });
     it('creates key chunk with timestamp (§2, §2.3.1.1)', () => {
         const payload = new Uint8Array([0x4F, 0x70, 0x75, 0x73]);
         const headers: LocHeaders = { captureTimestamp: 2000000n };
@@ -631,5 +654,36 @@ describe('encodeLocHeaders — unknown dedupe against the projection', () => {
         expect(back.timestamp).toBe(1n);
         expect(back.captureTimestamp).toBe(1n);
         expect(back.unknown).toBeUndefined();
+    });
+});
+
+describe('LOC-05 Codec String through the property block', () => {
+    for (const profile of ['d14-absolute-varint', 'd16-delta-varint', 'd18-delta-vi64'] as const) {
+        it(`round-trips on ${profile}`, () => {
+            const headers: LocHeaders = {
+                captureTimestamp: 1_700_000_000_000_000n,
+                codecString: 'avc1.64001f',
+                videoConfig: Uint8Array.from([1, 2, 3]),
+            };
+            const bytes = encodeLocHeaders(headers, { locVersion: 5, wireProfile: profile })!;
+            const parsed = parseLocHeaders(bytes, { wireProfile: profile });
+            expect(parsed).toMatchObject({ version: 5, codecString: 'avc1.64001f', captureTimestamp: 1_700_000_000_000_000n });
+            expect(parsed.videoConfig).toEqual(Uint8Array.from([1, 2, 3]));
+        });
+    }
+
+    it('writes 0x11 after 0x10 as a length-prefixed value (draft-16 delta)', () => {
+        const bytes = encodeLocHeaders({ captureTimestamp: 1n, codecString: 'opus' }, { locVersion: 5 })!;
+        // delta 0x10 -> varint 1; delta 1 -> 0x11 with length 4 and "opus".
+        expect(Array.from(bytes)).toEqual([0x10, 0x01, 0x01, 0x04, 0x6f, 0x70, 0x75, 0x73]);
+    });
+
+    it('a LOC-04 consumer-style parse keeps working: no codec string, version 4, when 0x11 is absent', () => {
+        const bytes = encodeLocHeaders({ captureTimestamp: 1n }, { locVersion: 5 })!;
+        expect(parseLocHeaders(bytes)).toMatchObject({ version: 4 });
+    });
+
+    it('refuses a codec string when the default LOC-01 is selected', () => {
+        expect(() => encodeLocHeaders({ codecString: 'opus' })).toThrow(LocEncodeError);
     });
 });

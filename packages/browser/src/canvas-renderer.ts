@@ -17,7 +17,7 @@
  * @module
  */
 
-import type { VideoRendererLike } from '@openmoq/player';
+import type { VideoRendererLike, VideoPresentation, VideoFrameObservation, VideoFrameObserver, VideoFrameReason, VideoProducedTiming } from '@openmoq/player';
 import type { ClockSource } from '@openmoq/playback';
 import { validateStallThresholdMs } from './mse-adapter.js';
 
@@ -25,6 +25,8 @@ import { validateStallThresholdMs } from './mse-adapter.js';
 interface QueuedFrame {
   readonly frame: VideoFrame;
   readonly renderTimeUs: number;
+  token?: object;
+  outputTiming?: VideoProducedTiming;
 }
 
 /** Default stall threshold: 500ms without rendering a frame. */
@@ -47,6 +49,7 @@ const FALLBACK_INTERVAL_MS = 16;
  * 5. First frame and stall detection fire lifecycle callbacks
  */
 export class CanvasRenderer implements VideoRendererLike {
+  readonly supportsOutputTiming = true;
   private readonly ctx: CanvasRenderingContext2D;
   private readonly queue: QueuedFrame[] = [];
   private readonly stallThresholdMs: number;
@@ -71,6 +74,16 @@ export class CanvasRenderer implements VideoRendererLike {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private destroyed = false;
+  private lastVideoPresentation: VideoPresentation | null = null;
+  private drawDepth = 0;
+  private drawRevision = 0;
+  private queueRevision = 0;
+  private frameObservers: Set<VideoFrameObserver> | undefined;
+
+  /** Last successful canvas draw; retained on pause, cleared on destruction. */
+  get videoPresentation(): VideoPresentation | null {
+    return this.destroyed || this.drawDepth > 0 ? null : this.lastVideoPresentation;
+  }
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
@@ -101,18 +114,51 @@ export class CanvasRenderer implements VideoRendererLike {
     this.clock = options?.clock ?? { now: () => performance.now() * 1000 };
   }
 
+  // Detaching suppresses events; queued tokens are forgotten at their terminal.
+  observeFrames(observer: VideoFrameObserver): () => void {
+    if (typeof observer !== 'function') throw new TypeError('Expected a frame observer');
+    const listeners = this.frameObservers ??= new Set();
+    const member: VideoFrameObserver = event => observer(event);
+    listeners.add(member);
+    return () => {
+      listeners.delete(member);
+      if (this.frameObservers === listeners && listeners.size === 0) this.frameObservers = undefined;
+    };
+  }
+
+  private observeFrame(entry: QueuedFrame, state: VideoFrameObservation['state'], reason: VideoFrameReason | null): void {
+    const token = entry.token;
+    if (token === undefined) return;
+    const outputTiming = entry.outputTiming;
+    // Forget terminal ownership before any reentrant callback can flush/destroy.
+    if (state !== 'scheduled') { delete entry.token; delete entry.outputTiming; }
+    const listeners = this.frameObservers;
+    if (!listeners) return;
+    for (const listener of [...listeners]) {
+      if (this.frameObservers !== listeners || !listeners.has(listener)) continue;
+      if (state === 'scheduled' && entry.token !== token) break;
+      try { const pending = listener({ token, state, reason, ...(outputTiming ? { outputTiming } : {}) }); if (pending) void Promise.resolve(pending).catch(() => {}); }
+      catch { /* Optional outcomes cannot change presentation. */ }
+    }
+  }
+
   /**
    * Enqueue a decoded frame for presentation.
    *
    * Frames are held until renderTick() presents them at the right time.
    * The frame WILL be closed by this renderer — callers must NOT close it.
    */
-  enqueue(frame: unknown, renderTimeUs: number): void {
+  enqueue(frame: unknown, renderTimeUs: number, token?: object, outputTiming?: VideoProducedTiming): void {
+    const observed = this.frameObservers?.size ? token : undefined;
+    const entry: QueuedFrame = { frame: frame as VideoFrame, renderTimeUs,
+      ...(observed === undefined ? {} : { token: observed, ...(outputTiming ? { outputTiming } : {}) }) };
     if (this.destroyed) {
       (frame as VideoFrame).close();
+      this.observeFrame(entry, 'discarded', 'destroyed');
       return;
     }
-    this.queue.push({ frame: frame as VideoFrame, renderTimeUs });
+    this.queue.push(entry);
+    this.observeFrame(entry, 'scheduled', null);
   }
 
   /**
@@ -127,6 +173,7 @@ export class CanvasRenderer implements VideoRendererLike {
    */
   renderTick(nowUs: number): void {
     if (this.destroyed) return;
+    const queueRevision = this.queueRevision;
 
     let rendered = false;
 
@@ -142,6 +189,8 @@ export class CanvasRenderer implements VideoRendererLike {
         // Late frame with newer frames behind it — drop (MUST close GPU memory)
         this.queue.shift();
         entry.frame.close();
+        this.observeFrame(entry, 'discarded', 'late frame');
+        if (this.destroyed || this.queueRevision !== queueRevision) return;
         continue;
       }
 
@@ -149,16 +198,34 @@ export class CanvasRenderer implements VideoRendererLike {
         // On time — render
         this.queue.shift();
 
-        // Capture timestamp BEFORE close — VideoFrame.timestamp is the
-        // CaptureTimestamp set during toVideoChunkInit() (LOC §2.3.1.1).
-        // Used for drift detection in the feedback path.
-        const captureTimestampUs = BigInt(entry.frame.timestamp);
+        // Capture the decoded timestamp before releasing the frame.
+        const frameTimestampUs = entry.frame.timestamp;
+        const captureTimestampUs = BigInt(frameTimestampUs);
+        const revision = ++this.drawRevision;
+        let witnessed = false;
 
-        this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
+        try {
+          this.drawDepth++;
+          try {
+            this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
+          } finally {
+            this.drawDepth--;
+            // A wrapper may reenter before or after its native draw. Neither
+            // invocation nor return order proves the final image in that case.
+            if (revision !== this.drawRevision) this.lastVideoPresentation = null;
+          }
+          witnessed = this.recordVideoPresentation(frameTimestampUs, revision);
+        } catch (error) {
+          // Publish the failure before propagating it; finally still owns frame.close().
+          this.observeFrame(entry, 'discarded', 'draw failed');
+          throw error;
+        } finally {
+          // Release even when drawing fails; only successful draws update evidence.
+          entry.frame.close();
+        }
 
-        // frame.close() is NON-NEGOTIABLE — GPU memory outside GC
-        entry.frame.close();
-
+        this.observeFrame(entry, witnessed ? 'presented' : 'unavailable', witnessed ? null : 'completion unproven');
+        if (this.destroyed || this.queueRevision !== queueRevision) return;
         rendered = true;
         // A genuinely rendered frame is the only thing that completes an
         // episode. Capture it here but publish only after every piece of frame
@@ -172,13 +239,9 @@ export class CanvasRenderer implements VideoRendererLike {
           if (episode.detected) recoveredMs = performance.now() - episode.startedMs;
         }
 
-        // First frame lifecycle
-        if (!this.firstFrameRendered) {
-          this.firstFrameRendered = true;
-          this.onFirstFrame?.();
-        }
+        const first = !this.firstFrameRendered;
+        this.firstFrameRendered = true;
 
-        this.onFrameRendered?.(captureTimestampUs, nowUs, entry.renderTimeUs);
         // Render-timing diagnostic: logs every 30th frame's scheduling
         // jitter (scheduled vs actual render time, inter-frame delta).
         // Enable via ?debug=render in the URL.
@@ -196,8 +259,20 @@ export class CanvasRenderer implements VideoRendererLike {
         }
         this.lastActualRenderUs = nowUs;
         this.lastRenderTimeMs = performance.now();
-        // All frame state committed — safe to publish.
-        if (recoveredMs !== null) this.onStallRecovered?.(recoveredMs);
+        // Complete accounting before first-frame publication. A listener may
+        // throw or retire this output, but cannot undo the completed draw.
+        let failed = false, failure: unknown;
+        try { this.onFrameRendered?.(captureTimestampUs, nowUs, entry.renderTimeUs); }
+        catch (error) { failed = true; failure = error; }
+        if (!this.destroyed && this.queueRevision === queueRevision && first) {
+          try { this.onFirstFrame?.(); }
+          catch (error) { if (!failed) { failed = true; failure = error; } }
+        }
+        if (!this.destroyed && this.queueRevision === queueRevision && recoveredMs !== null) {
+          try { this.onStallRecovered?.(recoveredMs); }
+          catch (error) { if (!failed) { failed = true; failure = error; } }
+        }
+        if (failed) throw failure;
       } else {
         // Future frame — stop processing
         break;
@@ -243,10 +318,9 @@ export class CanvasRenderer implements VideoRendererLike {
 
   /** Discard all queued frames. MUST close() all held frames. */
   flush(): void {
-    for (const entry of this.queue) {
-      entry.frame.close();
-    }
-    this.queue.length = 0;
+    this.queueRevision++;
+    const removed = this.queue.splice(0);
+    const reason = this.destroyed ? 'destroyed' : 'flushed';
     // Suppress *new* detection until the next frame renders, so a pause does
     // not read as a stall. An already-detected episode is deliberately kept:
     // the player's stall recovery flushes this renderer, and discarding it here
@@ -256,6 +330,7 @@ export class CanvasRenderer implements VideoRendererLike {
     if (this.stallEpisode !== null && !this.stallEpisode.detected) {
       this.stallEpisode = null;
     }
+    for (const entry of removed) { entry.frame.close(); this.observeFrame(entry, 'discarded', reason); }
   }
 
   /**
@@ -271,6 +346,7 @@ export class CanvasRenderer implements VideoRendererLike {
 
   /** Release resources. MUST close() all held frames. */
   destroy(): void {
+    this.lastVideoPresentation = null;
     this.cancelStallEpisode();
     this.destroyed = true;
     this.stop();
@@ -282,6 +358,27 @@ export class CanvasRenderer implements VideoRendererLike {
   }
 
   // ─── Internal ──────────────────────────────────────────────────
+
+  private recordVideoPresentation(timestampUs: number, revision: number): boolean {
+    if (this.destroyed || this.drawDepth > 0 || revision !== this.drawRevision) return false;
+    this.lastVideoPresentation = null;
+    let renderedAtUs: number;
+    try {
+      renderedAtUs = this.clock.now();
+    } catch {
+      // Treat anything escaping this diagnostic query as unavailable evidence,
+      // including exceptions from hooks it calls. Preserve the playback path.
+      return false;
+    }
+    if (this.destroyed || this.drawDepth > 0 || revision !== this.drawRevision) return false;
+    if (!Number.isFinite(renderedAtUs)) return false;
+    this.lastVideoPresentation = Object.freeze({
+      frameTimestampUs: Number.isSafeInteger(timestampUs) ? BigInt(timestampUs) : null,
+      timestampDomain: 'unknown',
+      renderedAtUs,
+    });
+    return true;
+  }
 
   private readonly onVisibilityChange = (): void => {
     if (!this.running) return;

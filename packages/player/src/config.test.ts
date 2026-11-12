@@ -12,6 +12,67 @@ function minConfig(overrides?: Partial<MoqtPlayerConfig>): MoqtPlayerConfig {
   return { url: 'https://relay.example.com/moq', namespace: 'live', ...overrides };
 }
 
+describe('catalog track name configuration', () => {
+  it.each(['.catalog', '', 'catálogo'])('accepts a lossless UTF-8 name %j', catalogTrackName => {
+    expect(() => validateConfig(minConfig({ catalogTrackName }))).not.toThrow();
+  });
+
+  it.each(['\ud800', '\udfff'])('rejects an ill-formed name %j before connecting', catalogTrackName => {
+    expect(() => validateConfig(minConfig({ catalogTrackName }))).toThrow(/UTF-8|surrogate/);
+  });
+
+  it('accepts a name that fills the Full Track Name limit exactly', () => {
+    // 'live' (4 bytes) + 4092 bytes = 4096 (§2.4.1).
+    expect(() => validateConfig(minConfig({ catalogTrackName: 'c'.repeat(4092) }))).not.toThrow();
+  });
+
+  it('rejects a name whose Full Track Name exceeds 4096 bytes before connecting', () => {
+    expect(() => validateConfig(minConfig({ catalogTrackName: 'c'.repeat(4093) }))).toThrow(/4096/);
+  });
+
+  it('counts UTF-8 bytes, not UTF-16 code units', () => {
+    // 'é' is one code unit but two UTF-8 bytes: 2047 * 2 + 4 = 4098.
+    expect(() => validateConfig(minConfig({ catalogTrackName: 'é'.repeat(2047) }))).toThrow(/4096/);
+  });
+
+  it('counts every namespace field toward the limit', () => {
+    const namespace = ['a'.repeat(2000), 'b'.repeat(2000)];
+    expect(() => validateConfig(minConfig({ namespace, catalogTrackName: 'c'.repeat(96) }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ namespace, catalogTrackName: 'c'.repeat(97) }))).toThrow(/4096/);
+  });
+
+  it.each([42, null])('rejects non-string name %j from an untyped caller', value => {
+    expect(() => validateConfig(minConfig({ catalogTrackName: value as unknown as string }))).toThrow(/catalogTrackName/);
+  });
+});
+
+describe('video altGroup configuration', () => {
+  it.each([0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid group ID %s', (videoAltGroup) => {
+    expect(() => validateConfig(minConfig({ videoAltGroup }))).toThrow('videoAltGroup');
+  });
+
+  it('accepts zero and leaves the default unset', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: 0 }))).not.toThrow();
+    expect((DEFAULT_PLAYER_CONFIG as Partial<MoqtPlayerConfig>).videoAltGroup).toBeUndefined();
+  });
+
+  it('accepts negative integer group labels permitted by MSF', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: -1 }))).not.toThrow();
+  });
+
+  it('rejects the catalog-free known-video fast path when a catalog group must be selected', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: 0, knownTracks: {
+      video: { name: 'v', codec: 'avc1.640028' },
+    } }))).toThrow('knownTracks');
+  });
+
+  it('also rejects the known-audio fast path rather than silently ignoring a requested video group', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: 0, knownTracks: {
+      audio: { name: 'a', codec: 'opus', samplerate: 48000, channels: 2 },
+    } }))).toThrow('knownTracks');
+  });
+});
+
 // ─── DEFAULT_PLAYER_CONFIG shape ─────────────────────────────────────
 
 describe('DEFAULT_PLAYER_CONFIG', () => {
@@ -22,6 +83,7 @@ describe('DEFAULT_PLAYER_CONFIG', () => {
     expect(DEFAULT_PLAYER_CONFIG.reconnectDelayMs).toBe(1_000);
     expect(DEFAULT_PLAYER_CONFIG.reconnectBackoff).toBe('exponential');
     expect(DEFAULT_PLAYER_CONFIG.moqtImplementation).toBe('proto-moq');
+    expect(DEFAULT_PLAYER_CONFIG.catalogTrackName).toBe('catalog');
     expect(DEFAULT_PLAYER_CONFIG.gapTimeoutMs).toBe(500);
     expect(DEFAULT_PLAYER_CONFIG.driftThresholdMs).toBe(200);
     expect(DEFAULT_PLAYER_CONFIG.maxBufferDepth).toBe(500);

@@ -5,8 +5,16 @@
  * @module
  */
 
-import type { CatalogState } from '@openmoq/msf';
+import type { CatalogNamespaceContext, CatalogState, CatalogTrack } from '@openmoq/msf';
+import { contextFields, identityKey, isTrackPackagingSupported, namespaceFieldsOf, selectVideoAltGroup } from '@openmoq/msf';
 import type { Level, AudioTrack } from './types.js';
+
+type MenuCatalog = Omit<CatalogState, 'tracks'> & { readonly tracks: readonly CatalogTrack[] };
+
+function menuIdentity(track: CatalogTrack, context: CatalogNamespaceContext): Pick<Level, 'id' | 'namespace'> {
+  const fields = namespaceFieldsOf(track) ?? contextFields(context);
+  return fields === undefined ? {} : { id: identityKey(fields, track.name), namespace: [...fields] };
+}
 
 /**
  * Generate a human-readable resolution label from track metadata.
@@ -30,14 +38,14 @@ function resolutionLabel(track: { height?: number; bitrate?: number; name: strin
  * Map MSF catalog video tracks to a sorted Level array for UI display.
  *
  * Sorted by bitrate descending (highest quality first, index 0 = best).
- * If the catalog has altGroups, uses the first video altGroup.
+ * Uses the requested video altGroup, or the first group when omitted.
  * Otherwise, uses all video tracks.
  *
- * @see draft-ietf-moq-msf-00 §5.1.13 (altGroup)
+ * @see draft-ietf-moq-msf-01 §5.2.12 (altGroup)
  */
-export function mapLevels(catalog: CatalogState): Level[] {
+export function mapLevels(catalog: MenuCatalog, videoAltGroup?: number, namespace?: CatalogNamespaceContext): Level[] {
   const videoTracks = catalog.tracks.filter(
-    t => t.codec && (
+    t => isTrackPackagingSupported(t) && t.codec && (
       t.codec.startsWith('avc1') ||
       t.codec.startsWith('hev1') ||
       t.codec.startsWith('hvc1') ||
@@ -47,10 +55,9 @@ export function mapLevels(catalog: CatalogState): Level[] {
     ),
   );
 
-  if (videoTracks.length === 0) return [];
-
   // Sort by bitrate descending (highest first)
-  const sorted = [...videoTracks].sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+  const sorted = selectVideoAltGroup(videoTracks, videoAltGroup)
+    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
 
   return sorted.map((track, index) => ({
     index,
@@ -60,6 +67,7 @@ export function mapLevels(catalog: CatalogState): Level[] {
     width: track.width ?? 0,
     height: track.height ?? 0,
     bitrate: track.bitrate ?? 0,
+    ...menuIdentity(track, namespace),
   }));
 }
 
@@ -68,7 +76,7 @@ export function mapLevels(catalog: CatalogState): Level[] {
  *
  * @see draft-ietf-moq-msf-00 §5.1.35 (language)
  */
-export function mapAudioTracks(catalog: CatalogState): AudioTrack[] {
+export function mapAudioTracks(catalog: MenuCatalog, namespace?: CatalogNamespaceContext): AudioTrack[] {
   const audioTracks = catalog.tracks.filter(
     t => t.codec && (
       t.codec.startsWith('mp4a') ||
@@ -80,12 +88,14 @@ export function mapAudioTracks(catalog: CatalogState): AudioTrack[] {
   );
 
   return audioTracks.map((track, index) => {
-    const lang = (track as unknown as Record<string, unknown>).language as string | undefined;
+    const lang = track.lang;
+    const identity = menuIdentity(track, namespace);
     return {
       index,
       label: track.label ?? lang ?? `Audio ${index + 1}`,
       language: lang,
       codec: track.codec ?? 'unknown',
+      ...(identity.id === undefined ? {} : { ...identity, trackName: track.name }),
     };
   });
 }

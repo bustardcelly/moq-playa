@@ -108,6 +108,8 @@ export const PlayerErrorCode = {
    * Fatal.
    */
   CMAF_INIT_TIMEOUT: 0x1203,
+  /** Catalog delivery is still pending after the diagnostic deadline; nonfatal. */
+  CATALOG_WAIT_TIMEOUT: 0x1204,
 
   // ── Playback (0x1300) ────────────────────────────────────
   /** Seek failed — timeline lookup or REQUEST_UPDATE error. @see MSF §7 */
@@ -119,6 +121,8 @@ export const PlayerErrorCode = {
   SUBSCRIPTION_REFUSED: 0x1302,
   /** All media track subscriptions refused — no playable content. @see §9.8 */
   ALL_TRACKS_REFUSED: 0x1303,
+  /** An explicit application selection could not be adopted. */
+  SELECTION_FAILED: 0x1304,
   // 0x1400 reserved: BUFFER_OVERFLOW (when pipeline backpressure lands)
 } as const;
 

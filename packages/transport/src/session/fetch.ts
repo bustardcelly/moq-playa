@@ -18,6 +18,9 @@
 
 import { FetchState, type FetchStateValue } from './types.js';
 
+type FetchLocation = { group: bigint; object: bigint };
+const before = (a: FetchLocation, b: FetchLocation) => a.group < b.group || (a.group === b.group && a.object < b.object);
+
 /** Joining Fetch fields carried by the state machine (§9.16.2). */
 export interface JoiningFetchState {
   /** 0x2 = Relative Joining Fetch, 0x3 = Absolute Joining Fetch. */
@@ -37,6 +40,9 @@ export class FetchStateMachine {
   private _errorReason: string | undefined;
   private _wasCanceled: boolean = false;
   private _joining: JoiningFetchState | undefined;
+  private _trackKey: string | undefined;
+  private _responseEnd: FetchLocation | undefined;
+  private _largestReceived: FetchLocation | undefined;
   // §10.13: FETCH_OK and the data stream are INDEPENDENT — "the FETCH_OK or
   // REQUEST_ERROR can come at any time relative to object delivery." A fetcher's
   // fetch is fully done only after BOTH the response (FETCH_OK) AND the data stream
@@ -63,8 +69,9 @@ export class FetchStateMachine {
     startObject?: bigint,
     endGroup?: bigint,
     endObject?: bigint,
+    trackKey?: string,
   ): FetchStateMachine {
-    return new FetchStateMachine(
+    const sm = new FetchStateMachine(
       requestId,
       false,
       startGroup,
@@ -72,6 +79,8 @@ export class FetchStateMachine {
       endGroup,
       endObject,
     );
+    sm._trackKey = trackKey;
+    return sm;
   }
 
   /**
@@ -107,11 +116,13 @@ export class FetchStateMachine {
   static createAsJoiningFetcher(
     requestId: bigint,
     joining: JoiningFetchState,
+    trackKey?: string,
   ): FetchStateMachine {
     const sm = joining.fetchType === 0x3
       ? new FetchStateMachine(requestId, false, joining.joiningStart, 0n)
       : new FetchStateMachine(requestId, false);
     sm._joining = joining;
+    sm._trackKey = trackKey;
     return sm;
   }
 
@@ -140,6 +151,9 @@ export class FetchStateMachine {
   get joining(): JoiningFetchState | undefined {
     return this._joining;
   }
+
+  /** Exact track identity retained only for this live fetch's cancellation. */
+  get trackKey(): string | undefined { return this._trackKey; }
 
   /**
    * Back-fill the publisher-side range once the application has resolved the
@@ -216,6 +230,32 @@ export class FetchStateMachine {
     return this._endObject;
   }
 
+  /** Admit ordinary DATA only; request End Object uses the SDK's half-open/zero convention. */
+  admitData(group: bigint, object: bigint): string | undefined {
+    const location = { group, object };
+    if (this._startGroup !== undefined && before(location, { group: this._startGroup, object: this._startObject ?? 0n })) {
+      return `FETCH DATA ${group}/${object} is before the requested start`;
+    }
+    if (this._endGroup !== undefined && (group > this._endGroup
+        || (group === this._endGroup && (this._endObject ?? 0n) > 0n && object >= this._endObject!))) {
+      return `FETCH DATA ${group}/${object} is after the requested end`;
+    }
+    if (this._responseEnd && before(this._responseEnd, location)) {
+      return `FETCH DATA ${group}/${object} is after the response end`;
+    }
+    if (!this._largestReceived || before(this._largestReceived, location)) this._largestReceived = location;
+    return undefined;
+  }
+
+  /** Retain one maximum until both OK and DATA finish, including DATA-FIN-before-OK. */
+  acceptResponseEnd(end: FetchLocation): string | undefined {
+    if (this._largestReceived && before(end, this._largestReceived)) {
+      return `FETCH response end ${end.group}/${end.object} precedes received DATA ${this._largestReceived.group}/${this._largestReceived.object}`;
+    }
+    this._responseEnd = { ...end };
+    return undefined;
+  }
+
   // ─── State Queries ────────────────────────────────────────────────────
 
   /** Whether fetch is pending (awaiting response). */
@@ -283,6 +323,15 @@ export class FetchStateMachine {
     this.assertNotTransferring('handleRequestError');
     this.assertNotPublisher('handleRequestError');
 
+    this._errorCode = errorCode;
+    this._errorReason = errorReason;
+    this._state = FetchState.COMPLETED;
+  }
+
+  /** Locally detected malformed Track semantics can terminate an active FETCH;
+   * unlike a peer REQUEST_ERROR, this is also valid after FETCH_OK. */
+  handleMalformedTrack(errorCode: bigint, errorReason: string): void {
+    this.assertNotPublisher('handleMalformedTrack');
     this._errorCode = errorCode;
     this._errorReason = errorReason;
     this._state = FetchState.COMPLETED;

@@ -16,6 +16,7 @@ export {
   ControlMessageType18,
   SetupOption18,
   MessageParam18,
+  MessageParam22,
   PropertyRange18,
   isMandatoryProperty,
 } from './control/codes-18.js';
@@ -39,12 +40,16 @@ export {
   decodeMessageParams18,
   messageParams18EncodingLength,
   DEFAULT_MESSAGE_PARAM_REGISTRY,
+  DRAFT22_MESSAGE_PARAM_REGISTRY,
+  typedLocationFilterLength,
 } from './control/message-params-18.js';
 export type {
   MessageParamValue,
   MessageParams18,
   MessageParamRegistry,
 } from './control/message-params-18.js';
+export { decodeFillParameters, resolveFillWindow } from './control/fill-parameters.js';
+export type { FillOptions } from './control/fill-parameters.js';
 export {
   encodeTrackProperties18,
   decodeTrackProperties18,
@@ -52,6 +57,7 @@ export {
   hasObjectOnlyTrackProperty,
   hasUnsupportedMandatoryTrackProperty,
 } from './control/track-properties-18.js';
+export { supportedPropertyFault } from './control/property-semantics.js';
 
 export {
   readUint8, writeUint8,
@@ -81,7 +87,7 @@ export { readReasonPhrase, writeReasonPhrase, reasonPhraseEncodingLength } from 
 // ─── Error Codes ─────────────────────────────────────────────────────
 export { SessionError, RequestError, PublishDoneCode, DataStreamError, ProtocolViolationError } from './errors.js';
 // draft-18 error code registries (canonical; the legacy exports above stay draft-14/16).
-export { RequestError18, PublishDoneCode18, StreamResetCode18, DataStreamError18 } from './errors.js';
+export { RequestError18, RequestError22, PublishDoneCode18, StreamResetCode18, DataStreamError18 } from './errors.js';
 
 // ─── Control Messages ────────────────────────────────────────────────
 export { MessageType } from './control/codes.js';
@@ -125,6 +131,7 @@ export type {
   SubscribeNamespace,
   SubscribeTracks,
   PublishBlocked,
+  PublishStateNotify,
   UnsubscribeNamespace,
   PublishNamespaceOk,
   PublishNamespaceError,
@@ -143,7 +150,8 @@ export { createControlCodec } from './control/codec.js';
 export type { ControlCodec, DraftVersion, DecodedControlMessage } from './control/codec.js';
 
 // ─── Profile (per-draft behavior bundle) ─────────────────────────────
-export { isWiredDraft, WIRED_DRAFTS } from './versions.js';
+export { isDraft22, isRequestStreamDraft, isWiredDraft, WIRED_DRAFTS } from './versions.js';
+export type { RequestStreamDraft } from './versions.js';
 export { getProtocolProfile } from './profile.js';
 export type { ProtocolProfile, ProfileCapabilities } from './profile.js';
 export { getRequestPolicy } from './session/request-policy.js';
@@ -178,6 +186,7 @@ export type {
   MoqtObject,
   MoqtObjectData,
   MoqtObjectGap,
+  ObjectHeaderLayout,
 } from './data/types.js';
 
 export {
@@ -188,7 +197,7 @@ export {
   decodeFetchObjectV14,
   decodeObjectDatagram,
 } from './data/decoder.js';
-export type { FetchPriorContext, DecodedFetchItem } from './data/decoder.js';
+export type { FetchPriorContext, DecodedFetchItem, FetchObjectHeaderLayout } from './data/decoder.js';
 
 export {
   decodeSubgroupHeader18,
@@ -198,7 +207,7 @@ export {
   decodeFetchObject18,
 } from './data/decoder-18.js';
 // GroupOrder is exported above from the neutral './data/types.js' (its home).
-export type { FetchObjectPrior18 } from './data/decoder-18.js';
+export type { FetchObjectPrior18, FetchObjectHeaderLayout18 } from './data/decoder-18.js';
 
 export { createDataCodec } from './data/data-codec.js';
 export type { DataCodec, StreamClass, DatagramClass } from './data/data-codec.js';
@@ -321,7 +330,17 @@ export { TrackAliasManager } from './session/track-alias.js';
 export type { TrackIdentity } from './session/track-alias.js';
 export { Session } from './session/session.js';
 export { SessionError as SessionProtocolError, SessionDrainingError } from './session/session.js';
-export type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions, RequestResult } from './session/session.js';
+export type { SetupOptions, AuthorizationOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions, RequestResult } from './session/session.js';
+export { AliasType, encodeAuthorizationToken, encodeAuthorizationToken18, parseAuthorizationToken, parseAuthorizationToken18 } from './control/auth-token.js';
+export type { AuthorizationToken as WireAuthorizationToken } from './control/auth-token.js';
 export { resolveJoiningFetchRange, type JoiningFetchFields } from './session/joining.js';
-export { decodeSubscriptionFilter } from './control/subscription-filter.js';
-export type { SubscriptionFilter } from './control/subscription-filter.js';
+export {
+  decodeSubscriptionFilter,
+  encodeFillParameters,
+  encodeTypedLocationFilter,
+  encodeFetchLocationFilter,
+  decodeFetchLocationFilter,
+  subscriptionWindow,
+  windowContains,
+} from './control/subscription-filter.js';
+export type { SubscriptionFilter, SubscriptionWindow } from './control/subscription-filter.js';
