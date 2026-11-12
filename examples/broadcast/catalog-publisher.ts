@@ -16,10 +16,18 @@
  * The catalog advertises only tracks the capture can actually publish: audio
  * is included only when {@link BroadcastCatalogParams.audio} is present (a
  * screen capture without audio must not advertise an audio track).
+ *
+ * It also advertises a mediatimeline and a video SAP eventtimeline. Those
+ * describe the video (and audio, when present); they are not media tracks.
  */
-import { varint, SubgroupIdMode, PublishDoneCode } from '@openmoq/transport';
+import { varint, SubgroupIdMode, PublishDoneCode, isRequestStreamDraft } from '@openmoq/transport';
 import type { DraftVersion } from '@openmoq/transport';
-import { buildCatalog } from '@openmoq/msf';
+import { buildCatalog, CMSF_SAP_EVENT_TYPE } from '@openmoq/msf';
+
+/** Media timeline track. Object 0 of each group is the full PTS→location index. */
+export const MEDIA_TIMELINE_TRACK = 'timeline';
+/** SAP event timeline for the video track. One record per video group. */
+export const SAP_TIMELINE_TRACK = 'video-sap-timeline';
 
 /** Bound on EACH step of an error-response transaction (the best-effort stream
  *  close and the terminal/rejection write). A write that never settles must not
@@ -152,7 +160,7 @@ export async function acceptCatalogSubscribe(
         endOfGroup: true,
         defaultPriority: true,
         subgroupIdMode: SubgroupIdMode.ZERO,
-        ...(wire.draft === 18 ? { firstObject: true } : {}),
+        ...(isRequestStreamDraft(wire.draft) ? { firstObject: true } : {}),
       },
     );
     await connection.sendObject(streamId, varint(0), catalogPayload);
@@ -205,7 +213,10 @@ async function terminateFailedCatalog(
 /** Assemble the catalog payload. Pure: no wire effects, so a failure here is
  *  safely recoverable by answering the request with a rejection. */
 function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array {
-  return buildCatalog({
+  // buildCatalog does not emit timeline fields (mimeType, depends, eventType).
+  // Append those tracks to its JSON so this example does not depend on a
+  // builder change.
+  const catalog = JSON.parse(new TextDecoder().decode(buildCatalog({
     tracks: [
       {
         name: 'video',
@@ -231,7 +242,25 @@ function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array {
         renderGroup: 1,
       }] : []),
     ],
-  });
+  }))) as { tracks: Record<string, unknown>[] };
+  catalog.tracks.push(
+    {
+      name: MEDIA_TIMELINE_TRACK,
+      packaging: 'mediatimeline',
+      isLive: true,
+      mimeType: 'application/json',
+      depends: params.audio ? ['video', 'audio'] : ['video'],
+    },
+    {
+      name: SAP_TIMELINE_TRACK,
+      packaging: 'eventtimeline',
+      isLive: true,
+      mimeType: 'application/json',
+      eventType: CMSF_SAP_EVENT_TYPE,
+      depends: ['video'],
+    },
+  );
+  return new TextEncoder().encode(JSON.stringify(catalog));
 }
 
 /** Answer a request we never accepted. If even the rejection cannot be sent,

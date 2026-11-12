@@ -34,6 +34,7 @@
  */
 import { encodeLocHeaders, locWireProfileForDraft, type LocVersion } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
+import { isRequestStreamDraft } from '@openmoq/transport';
 
 /** The subset of MoqtConnection the media publication path uses. */
 export interface MediaPublishConnection {
@@ -69,7 +70,7 @@ export interface AudioChunkMeta {
 export interface MediaPublisherOptions {
   /** Wraps a bigint as the wire integer type (the example passes `varint`). */
   wrapInt: (n: bigint) => unknown;
-  /** NEGOTIATED MoQT draft — selects the LOC wire profile and, on draft-18,
+  /** NEGOTIATED MoQT draft — selects the LOC wire profile and, on draft 18+,
    *  the mandatory FIRST_OBJECT subgroup bit. Typed (not `number`) so an
    *  unsupported draft cannot silently inherit draft-16 LOC behavior. */
   draft: DraftVersion;
@@ -85,6 +86,12 @@ export interface MediaPublisherOptions {
   onError?: (context: string, err: unknown) => void;
   /** Counter sink for UI updates: called after each published object. */
   onCounts?: (videoFrames: number, audioChunks: number) => void;
+  /**
+   * A video keyframe was published as object 0 of a new group. `mediaPtsMs`
+   * is milliseconds since the first published keyframe; `wallclockMs` is
+   * the rebased capture time. Used to publish timeline tracks.
+   */
+  onVideoGroup?: (group: { groupId: bigint; mediaPtsMs: number; wallclockMs: number }) => void;
   /** Queue bounds (frames/chunks). Defaults: video 60, audio 50. */
   videoQueueMax?: number;
   audioQueueMax?: number;
@@ -99,7 +106,7 @@ export interface MediaPublisherOptions {
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
-const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18];
+const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 22];
 
 /** Validate a queue bound: NaN/Infinity would disable backpressure entirely
  *  and a non-positive or fractional cap has no coherent meaning. */
@@ -123,12 +130,17 @@ export class MediaPublisher {
   private audioTsOffsetUs: number | null = null;
   private readonly onError: (context: string, err: unknown) => void;
   private readonly onCounts: ((v: number, a: number) => void) | null;
+  private readonly onVideoGroup: ((group: { groupId: bigint; mediaPtsMs: number; wallclockMs: number }) => void) | null;
+  /** Rebased capture time of the first published keyframe. Media PTS is measured from it. */
+  private videoOriginUs: bigint | null = null;
   private readonly videoQueueMax: number;
   private readonly audioQueueMax: number;
   private readonly audioMaxInFlight: number;
 
   private videoAlias: bigint | null = null;
   private audioAlias: bigint | null = null;
+  private videoEpoch = 0;
+  private audioEpoch = 0;
 
   private videoGroupId: bigint;
   private videoObjectId = 0n;
@@ -174,6 +186,7 @@ export class MediaPublisher {
     this.wallClockUs = options.wallClockUs ?? (() => Date.now() * 1000);
     this.onError = options.onError ?? (() => {});
     this.onCounts = options.onCounts ?? null;
+    this.onVideoGroup = options.onVideoGroup ?? null;
     this.videoQueueMax = options.videoQueueMax ?? 60;
     this.audioQueueMax = options.audioQueueMax ?? 50;
     this.audioMaxInFlight = options.audioMaxInFlight ?? 8;
@@ -182,8 +195,29 @@ export class MediaPublisher {
   }
 
   /** Bind the relay-subscribed aliases (from the accepted SUBSCRIBEs). */
-  setVideoAlias(alias: bigint): void { this.videoAlias = alias; }
-  setAudioAlias(alias: bigint): void { this.audioAlias = alias; }
+  setVideoAlias(alias: bigint | null): void {
+    if (this.videoAlias === alias) return;
+    this.videoEpoch++;
+    this.videoAlias = alias;
+    this.videoQueue.length = 0;
+    this.videoContinuityLost = false;
+    const streamId = this.videoStreamId;
+    this.videoStreamId = null;
+    if (streamId !== null) this.trackClose(streamId);
+  }
+  setAudioAlias(alias: bigint | null): void {
+    if (this.audioAlias === alias) return;
+    this.audioEpoch++;
+    this.audioAlias = alias;
+    this.audioQueue.length = 0;
+    this.audioOverflowing = false;
+  }
+  clearVideoAlias(alias: bigint): void {
+    if (this.videoAlias === alias) this.setVideoAlias(null);
+  }
+  clearAudioAlias(alias: bigint): void {
+    if (this.audioAlias === alias) this.setAudioAlias(null);
+  }
 
   get frameCount(): number { return this.videoFrames; }
   get audioChunkCount(): number { return this.audioChunks; }
@@ -296,7 +330,7 @@ export class MediaPublisher {
       hasExtensions: true,
       endOfGroup: true,
       publisherPriority: priority,
-      ...(this.draft === 18 ? { firstObject: true } : {}),
+      ...(isRequestStreamDraft(this.draft) ? { firstObject: true } : {}),
     };
   }
 
@@ -309,10 +343,11 @@ export class MediaPublisher {
       try {
         while (this.videoQueue.length > 0 && !this.stopped) {
           const item = this.videoQueue.shift()!;
+          const epoch = this.videoEpoch;
           try {
             await this.sendVideoChunk(item.data, item.meta);
           } catch (err) {
-            this.report('video publish', err);
+            if (epoch === this.videoEpoch) this.report('video publish', err);
           }
         }
       } finally {
@@ -330,11 +365,12 @@ export class MediaPublisher {
     while (this.audioQueue.length > 0 && !this.stopped && this.audioInFlight.size < this.audioMaxInFlight) {
       const item = this.audioQueue.shift()!;
       const groupId = ++this.audioGroupId;
+      const epoch = this.audioEpoch;
       const inFlight = (async () => {
         try {
           await this.sendAudioChunk(item.data, item.meta, groupId);
         } catch (err) {
-          this.report('audio publish', err);
+          if (epoch === this.audioEpoch) this.report('audio publish', err);
         }
       })();
       this.audioInFlight.add(inFlight);
@@ -389,6 +425,9 @@ export class MediaPublisher {
   }
 
   private async sendVideoChunk(data: Uint8Array, meta: VideoChunkMeta): Promise<void> {
+    const alias = this.videoAlias;
+    const epoch = this.videoEpoch;
+    if (alias === null) return;
     if (meta.isKeyframe) {
       // New group per keyframe. The previous subgroup has no further writers
       // (the pump is the only one), so its close needs no await — but it
@@ -404,19 +443,37 @@ export class MediaPublisher {
       // endOfGroup: true — required for one-subgroup-per-GOP LOC video.
       // Without this, receivers cannot distinguish normal group completion
       // from an incomplete group and will wait for the intra-group timeout.
-      this.videoStreamId = await this.connection.openSubgroup(
-        this.wrapInt(this.videoAlias!), this.wrapInt(this.videoGroupId), this.wrapInt(0n),
+      const streamId = await this.connection.openSubgroup(
+        this.wrapInt(alias), this.wrapInt(this.videoGroupId), this.wrapInt(0n),
         this.subgroupOptions(128),
       );
+      if (epoch !== this.videoEpoch) {
+        this.trackClose(streamId);
+        return;
+      }
+      this.videoStreamId = streamId;
     }
     // No open subgroup — either pre-first-keyframe, or the group was retired
     // by a failure. Dependent frames are dropped until the next keyframe.
     if (this.videoStreamId === null) return;
 
+    const objectId = this.videoObjectId;
+    let timelineGroup: { groupId: bigint; mediaPtsMs: number; wallclockMs: number } | null = null;
+    if (objectId === 0n) {
+      const captureUs = this.toWallClockUs('video', meta.timestampUs);
+      if (this.videoOriginUs === null) this.videoOriginUs = captureUs;
+      const deltaUs = captureUs - this.videoOriginUs;
+      timelineGroup = {
+        groupId: this.videoGroupId,
+        mediaPtsMs: Number(deltaUs > 0n ? deltaUs / 1000n : 0n),
+        wallclockMs: Number(captureUs / 1000n),
+      };
+    }
     try {
       await this.connection.sendObject(
-        this.videoStreamId, this.wrapInt(this.videoObjectId), data, this.videoExtensions(meta));
+        this.videoStreamId, this.wrapInt(objectId), data, this.videoExtensions(meta));
     } catch (err) {
+      if (epoch !== this.videoEpoch) return;
       // LOC: Object 0 of a subgroup must be the independent frame. After a
       // failed (or ambiguous) send the group is unusable — retire it, so
       // deltas drop until the next keyframe opens a fresh group at Object 0.
@@ -425,21 +482,30 @@ export class MediaPublisher {
       this.trackClose(broken);
       throw err;
     }
+    if (epoch !== this.videoEpoch) return;
     this.videoObjectId++;
     this.videoFrames++;
     this.onCounts?.(this.videoFrames, this.audioChunks);
+    if (timelineGroup) this.onVideoGroup?.(timelineGroup);
   }
 
   private async sendAudioChunk(data: Uint8Array, meta: AudioChunkMeta, groupId: bigint): Promise<void> {
+    const alias = this.audioAlias;
+    const epoch = this.audioEpoch;
+    if (alias === null) return;
     const extensions = encodeLocHeaders({
       captureTimestamp: this.toWallClockUs('audio', meta.timestampUs),
     }, this.locOptions());
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
     const streamId = await this.connection.openSubgroup(
-      this.wrapInt(this.audioAlias!), this.wrapInt(groupId), this.wrapInt(0n),
+      this.wrapInt(alias), this.wrapInt(groupId), this.wrapInt(0n),
       this.subgroupOptions(64),
     );
+    if (epoch !== this.audioEpoch) {
+      this.trackClose(streamId);
+      return;
+    }
     try {
       await this.connection.sendObject(streamId, this.wrapInt(0n), data, extensions);
     } catch (err) {
@@ -447,6 +513,7 @@ export class MediaPublisher {
       throw err;
     }
     await this.trackClose(streamId);
+    if (epoch !== this.audioEpoch) return;
     this.audioChunks++;
     this.onCounts?.(this.videoFrames, this.audioChunks);
     if (this.audioQueue.length < this.audioQueueMax) this.audioOverflowing = false;

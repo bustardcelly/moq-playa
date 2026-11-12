@@ -78,6 +78,81 @@ const makePublisher = (conn: MediaPublishConnection, opts: Partial<MediaPublishe
 
 async function settle() { await new Promise((r) => setTimeout(r, 0)); }
 
+describe('MediaPublisher — cancelled subscriptions', () => {
+  it.each(['video', 'audio'] as const)('does not count a cancelled %s send that fulfills late', async (track) => {
+    const conn = recordingConnection({ holdSends: true });
+    const pub = makePublisher(conn);
+    if (track === 'video') {
+      pub.setVideoAlias(2n);
+      pub.publishVideo(chunk(1), kf());
+    } else {
+      pub.setAudioAlias(2n);
+      pub.publishAudio(chunk(1), { timestampUs: 1 });
+    }
+    await settle();
+    if (track === 'video') pub.clearVideoAlias(2n); else pub.clearAudioAlias(2n);
+    await conn.releaseAll();
+    expect(pub.frameCount).toBe(0);
+    expect(pub.audioChunkCount).toBe(0);
+  });
+
+  it.each(['video', 'audio'] as const)('drops queued %s and contains a cancelled in-flight send', async (track) => {
+    const conn = recordingConnection({ holdSends: true });
+    const errors: unknown[] = [];
+    const pub = makePublisher(conn, { audioMaxInFlight: 1, onError: (_, error) => errors.push(error) });
+    if (track === 'video') pub.setVideoAlias(2n); else pub.setAudioAlias(2n);
+    const publish = (tag: number) => track === 'video'
+      ? pub.publishVideo(chunk(tag), kf(tag)) : pub.publishAudio(chunk(tag), { timestampUs: tag });
+    publish(1);
+    await settle();
+    publish(2);
+    if (track === 'video') pub.clearVideoAlias(2n); else pub.clearAudioAlias(2n);
+    await conn.rejectAllPending(new Error('subscription cancelled'));
+    publish(3);
+    await settle();
+    expect(conn.opened).toHaveLength(1);
+    expect(errors).toEqual([]);
+    if (track === 'video') pub.setVideoAlias(4n); else pub.setAudioAlias(4n);
+    publish(4);
+    await conn.releaseAll();
+    expect(conn.opened.map((s) => s.alias)).toEqual([2n, 4n]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([1, 4]);
+  });
+
+  it.each(['video', 'audio'] as const)('does not send or revive a cancelled %s stream when its open resolves late', async (track) => {
+    const conn = recordingConnection();
+    let release!: (id: bigint) => void;
+    const original = conn.openSubgroup;
+    conn.openSubgroup = () => new Promise((resolve) => { release = resolve; });
+    const pub = makePublisher(conn);
+    if (track === 'video') {
+      pub.setVideoAlias(2n);
+      pub.publishVideo(chunk(1), kf());
+      pub.clearVideoAlias(2n);
+      pub.setVideoAlias(4n);
+    } else {
+      pub.setAudioAlias(2n);
+      pub.publishAudio(chunk(1), { timestampUs: 1 });
+      pub.clearAudioAlias(2n);
+      pub.setAudioAlias(4n);
+    }
+    release(99n);
+    await settle();
+    expect(conn.sends).toEqual([]);
+    expect(conn.closed).toContain(99n);
+    conn.openSubgroup = original;
+    if (track === 'video') {
+      pub.publishVideo(chunk(2), delta());
+      await settle();
+      expect(conn.sends).toEqual([]);
+      pub.publishVideo(chunk(3), kf());
+    } else pub.publishAudio(chunk(3), { timestampUs: 3 });
+    await settle();
+    expect(conn.opened.map((s) => s.alias)).toEqual([4n]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([3]);
+  });
+});
+
 describe('MediaPublisher — serialized video publication', () => {
   it('back-to-back chunks with deferred sends get UNIQUE, ORDERED object IDs on one subgroup', async () => {
     const conn = recordingConnection({ holdSends: true });
@@ -215,6 +290,25 @@ describe('MediaPublisher — serialized video publication', () => {
     await settle();
     expect(conn.sends.filter((x) => x.payload[0] === 1)).toHaveLength(1);
     await expect(pub.stop()).resolves.toBeUndefined();
+  });
+
+  it('reports each keyframe group with media time measured from the first keyframe', async () => {
+    const conn = recordingConnection();
+    const groups: Array<{ groupId: bigint; mediaPtsMs: number; wallclockMs: number }> = [];
+    const pub = makePublisher(conn, {
+      wallClockUs: () => 1_700_000_000_000_000,
+      onVideoGroup: (group) => groups.push(group),
+    });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf(0));
+    pub.publishVideo(chunk(1), delta(33_000));
+    pub.publishVideo(chunk(2), kf(2_000_000));
+    await settle();
+    expect(groups).toHaveLength(2);
+    expect(groups[0]!.mediaPtsMs).toBe(0);
+    expect(groups[1]!.mediaPtsMs).toBe(2000);
+    expect(groups[1]!.groupId).toBe(groups[0]!.groupId + 1n);
+    expect(groups[0]!.wallclockMs).toBe(1_700_000_000_000);
   });
 });
 
@@ -366,8 +460,8 @@ describe('MediaPublisher — broadcast generations', () => {
 });
 
 describe('MediaPublisher — negotiated-draft wire binding', () => {
-  it('draft-18 subgroup opens set FIRST_OBJECT on video AND audio; 16/14 do not', async () => {
-    for (const draft of [14, 16, 18] as const) {
+  it('draft-18 and 22 subgroup opens set FIRST_OBJECT on video AND audio; 16/14 do not', async () => {
+    for (const draft of [14, 16, 18, 22] as const) {
       const conn = recordingConnection();
       const pub = makePublisher(conn, { draft });
       pub.setVideoAlias(2n);
@@ -377,13 +471,24 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
       await settle();
       expect(conn.opened).toHaveLength(2);
       for (const o of conn.opened) {
-        if (draft === 18) {
+        if (draft >= 18) {
           expect(o.options['firstObject']).toBe(true); // §2.2 MUST for the original publisher
         } else {
           expect('firstObject' in o.options).toBe(false); // d14/16 bytes preserved
         }
       }
     }
+  });
+
+  it('draft 22 keeps the draft-18 LOC wire profile', async () => {
+    const timestampUs = Date.now() * 1000;
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { draft: 22, wallClockUs: () => timestampUs });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
+    await settle();
+    const parsed = parseLocHeaders(conn.sends[0]!.extensions, { wireProfile: locWireProfileForDraft(18) });
+    expect(parsed.captureTimestamp).toBe(BigInt(Math.round(timestampUs)));
   });
 
   it('draft-18 LOC extensions use the vi64 profile: they parse as d18 and are NOT d16 bytes', async () => {

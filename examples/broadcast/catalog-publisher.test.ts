@@ -62,7 +62,7 @@ describe('broadcast catalog subscription lifecycle', () => {
 
     const catalog = parseCatalog(conn.sent[0]!);
     const names = catalog.tracks.map((t) => t.name).sort();
-    expect(names).toEqual(['audio', 'video']);
+    expect(names).toEqual(['audio', 'timeline', 'video', 'video-sap-timeline']);
   });
 
   it('leaves the catalog subscription established: no terminal is sent for a live broadcast', async () => {
@@ -166,7 +166,8 @@ describe('broadcast catalog subscription lifecycle', () => {
     const { audio: _audio, ...noAudio } = PARAMS;
     await acceptCatalogSubscribe(conn, 1n, 1n, noAudio, D16);
     const catalog = parseCatalog(conn.sent[0]!);
-    expect(catalog.tracks.map((t) => t.name)).toEqual(['video']);
+    expect(catalog.tracks.map((t) => t.name)).toEqual(['video', 'timeline', 'video-sap-timeline']);
+    expect(catalog.tracks.find((t) => t.name === 'timeline')?.depends).toEqual(['video']);
   });
 
   it('draft-18 sets FIRST_OBJECT on the catalog subgroup; 16/14 do not', async () => {

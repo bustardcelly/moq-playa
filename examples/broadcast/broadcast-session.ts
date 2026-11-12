@@ -9,10 +9,11 @@
  * subscriptions or consume aliases, and a delayed `onClose` can no longer
  * stop or mutate the replacement generation.
  */
-import { acceptCatalogSubscribe } from './catalog-publisher.js';
+import { acceptCatalogSubscribe, MEDIA_TIMELINE_TRACK, SAP_TIMELINE_TRACK } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 import { MediaPublisher } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
+import { TimelinePublisher } from './timeline-publisher.js';
 
 /** The subset of MoqtConnection a broadcast generation uses. */
 export interface BroadcastSessionConnection extends MediaPublishConnection {
@@ -49,14 +50,18 @@ const CLOSE_DEADLINE_MS = 1000;
  *  (it never rejects, so abandoning it surfaces nothing). */
 const POST_CLOSE_DEADLINE_MS = 250;
 
+type ServedTrack = 'video' | 'audio' | typeof MEDIA_TIMELINE_TRACK | typeof SAP_TIMELINE_TRACK;
+
 export class BroadcastSession {
   readonly publisher: MediaPublisher;
+  private readonly timeline: TimelinePublisher;
   private readonly connection: BroadcastSessionConnection;
   private readonly opts: BroadcastSessionOptions;
   private readonly wrapInt: (n: bigint) => unknown;
   /** Per-generation alias space — a restart starts a fresh allocator. */
   private nextAlias = 1n;
   private retired = false;
+  private readonly mediaSubscriptions = new Map<ServedTrack, { requestId: bigint; alias: bigint }>();
   /** Session-owned in-flight work (catalog publication) that shutdown()
    *  must account for. */
   private readonly pendingWork = new Set<Promise<void>>();
@@ -71,7 +76,15 @@ export class BroadcastSession {
     this.connection = connection;
     this.opts = opts;
     this.wrapInt = opts.publisher.wrapInt;
-    this.publisher = new MediaPublisher(connection, opts.publisher);
+    this.timeline = new TimelinePublisher(connection, {
+      wrapInt: opts.publisher.wrapInt,
+      draft: opts.publisher.draft,
+      onError: opts.publisher.onError,
+    });
+    this.publisher = new MediaPublisher(connection, {
+      ...opts.publisher,
+      onVideoGroup: (group) => this.timeline.noteGroup(group),
+    });
   }
 
   /**
@@ -102,32 +115,50 @@ export class BroadcastSession {
         })
         .catch(report);
       this.trackWork(work);
-    } else if (trackName === 'video') {
-      this.connection.acceptSubscribe(this.wrapInt(requestId), this.wrapInt(alias))
-        .then(() => {
-          if (this.retired) return; // never arm a retired generation's publisher
-          this.publisher.setVideoAlias(alias);
-          this.safeLog(`Accepted video subscription`);
-        })
-        .catch(report);
-    } else if (trackName === 'audio') {
-      if (!this.opts.catalog.audio) {
+    } else if (
+      trackName === 'video' || trackName === 'audio'
+      || trackName === MEDIA_TIMELINE_TRACK || trackName === SAP_TIMELINE_TRACK
+    ) {
+      if (trackName === 'audio' && !this.opts.catalog.audio) {
         // The capture has no audio track — the catalog does not advertise
         // one, and a subscription for it cannot ever be served.
         this.connection.rejectSubscribe(this.wrapInt(requestId), this.wrapInt(0n), 'No audio in this broadcast')
           .catch(report);
         return;
       }
+      const previous = this.mediaSubscriptions.get(trackName);
+      if (previous) this.handleSubscribeClosed(previous.requestId);
+      const subscription = { requestId, alias };
+      this.mediaSubscriptions.set(trackName, subscription);
       this.connection.acceptSubscribe(this.wrapInt(requestId), this.wrapInt(alias))
         .then(() => {
-          if (this.retired) return;
-          this.publisher.setAudioAlias(alias);
-          this.safeLog(`Accepted audio subscription`);
+          if (this.retired || this.mediaSubscriptions.get(trackName) !== subscription) return;
+          if (trackName === 'video') this.publisher.setVideoAlias(alias);
+          else if (trackName === 'audio') this.publisher.setAudioAlias(alias);
+          else if (trackName === MEDIA_TIMELINE_TRACK) this.timeline.setMediaAlias(alias);
+          else this.timeline.setSapAlias(alias);
+          this.safeLog(`Accepted ${trackName} subscription`);
         })
-        .catch(report);
+        .catch((err) => {
+          if (this.mediaSubscriptions.get(trackName) !== subscription) return;
+          this.handleSubscribeClosed(requestId);
+          report(err);
+        });
     } else {
       this.connection.rejectSubscribe(this.wrapInt(requestId), this.wrapInt(0n), `Unknown track: ${trackName}`)
         .catch(report);
+    }
+  }
+
+  /** §5.1.1: stop queued publication for the cancelled request; the adapter resets its streams. */
+  handleSubscribeClosed(requestId: bigint): void {
+    for (const [track, subscription] of this.mediaSubscriptions) {
+      if (subscription.requestId !== requestId) continue;
+      this.mediaSubscriptions.delete(track);
+      if (track === 'video') this.publisher.clearVideoAlias(subscription.alias);
+      else if (track === 'audio') this.publisher.clearAudioAlias(subscription.alias);
+      else if (track === MEDIA_TIMELINE_TRACK) this.timeline.setMediaAlias(null);
+      else this.timeline.setSapAlias(null);
     }
   }
 
@@ -138,7 +169,9 @@ export class BroadcastSession {
   handleClose(error?: number, reason?: string): void {
     if (this.retired) return;
     this.retired = true;
+    this.mediaSubscriptions.clear();
     this.publisher.retire();
+    this.timeline.retire();
     this.opts.onSessionClosed?.(error, reason);
   }
 
@@ -186,12 +219,15 @@ export class BroadcastSession {
 
   private async runShutdown(): Promise<void> {
     this.retired = true;
+    this.mediaSubscriptions.clear();
     this.publisher.retire();
+    this.timeline.retire();
 
     // Every stage below is CONTAINED and BOUNDED: shutdown resolves even if
     // the drain, the logger, a tracked work item, or close() itself misbehaves.
     const graceful = Promise.all([
       this.publisher.drain().then(() => {}, () => {}),
+      this.timeline.drain().then(() => {}, () => {}),
       ...this.pendingWork,
     ]).then(() => {}, () => {});
 
