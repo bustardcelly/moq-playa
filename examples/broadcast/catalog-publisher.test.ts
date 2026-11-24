@@ -161,6 +161,13 @@ describe('broadcast catalog subscription lifecycle', () => {
     expect(conn.calls).toContain('close');
   });
 
+  it('omits the media timeline when mediaTimeline is false', async () => {
+    const conn = recordingConnection();
+    await acceptCatalogSubscribe(conn, 1n, 1n, { ...PARAMS, mediaTimeline: false }, D16);
+    const catalog = parseCatalog(conn.sent[0]!);
+    expect(catalog.tracks.map((t) => t.name).sort()).toEqual(['audio', 'video', 'video-sap-timeline']);
+  });
+
   it('omits the audio track when the capture has none', async () => {
     const conn = recordingConnection();
     const { audio: _audio, ...noAudio } = PARAMS;

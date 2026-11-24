@@ -136,6 +136,11 @@ export class BroadcastSession {
           .catch(report);
         return;
       }
+      if (trackName === MEDIA_TIMELINE_TRACK && this.opts.catalog.mediaTimeline === false) {
+        this.connection.rejectSubscribe(this.wrapInt(requestId), this.wrapInt(0n), 'No media timeline in this broadcast')
+          .catch(report);
+        return;
+      }
       const previous = this.mediaSubscriptions.get(trackName);
       if (previous) this.handleSubscribeClosed(previous.requestId);
       const subscription = { requestId, alias };

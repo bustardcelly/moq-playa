@@ -269,6 +269,16 @@ describe('BroadcastSession — generation isolation', () => {
   });
 });
 
+describe('BroadcastSession — optional media timeline', () => {
+  it('rejects a media-timeline subscription when the broadcast is not publishing one', async () => {
+    const conn = recordingConnection();
+    const session = makeSession(conn, { catalog: { ...CATALOG, mediaTimeline: false } });
+    session.handleSubscribe(1n, 'timeline');
+    await settle();
+    expect(conn.calls).toEqual(['rejectSubscribe']);
+  });
+});
+
 describe('BroadcastSession — audio-less capture', () => {
   it('rejects an audio subscription when the capture has no audio track', async () => {
     const conn = recordingConnection();

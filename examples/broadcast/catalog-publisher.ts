@@ -17,8 +17,10 @@
  * is included only when {@link BroadcastCatalogParams.audio} is present (a
  * screen capture without audio must not advertise an audio track).
  *
- * It also advertises a mediatimeline and a video SAP eventtimeline. Those
- * describe the video (and audio, when present); they are not media tracks.
+ * It also advertises a mediatimeline, unless
+ * {@link BroadcastCatalogParams.mediaTimeline} is false, and a video SAP
+ * eventtimeline. Those describe the video (and audio, when present); they
+ * are not media tracks.
  */
 import { varint, SubgroupIdMode, PublishDoneCode, isRequestStreamDraft } from '@openmoq/transport';
 import type { DraftVersion } from '@openmoq/transport';
@@ -109,6 +111,9 @@ export interface BroadcastCatalogParams {
     sampleRate: number;
     channels: number;
   };
+  /** When false, the catalog does not advertise the mediatimeline track.
+   *  Omitted means advertise it. */
+  mediaTimeline?: boolean;
 }
 
 /**
@@ -244,23 +249,23 @@ function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array {
       }] : []),
     ],
   }))) as { tracks: Record<string, unknown>[] };
-  catalog.tracks.push(
-    {
+  if (params.mediaTimeline !== false) {
+    catalog.tracks.push({
       name: MEDIA_TIMELINE_TRACK,
       packaging: 'mediatimeline',
       isLive: true,
       mimeType: 'application/json',
       depends: params.audio ? ['video', 'audio'] : ['video'],
-    },
-    {
-      name: SAP_TIMELINE_TRACK,
-      packaging: 'eventtimeline',
-      isLive: true,
-      mimeType: 'application/json',
-      eventType: CMSF_SAP_EVENT_TYPE,
-      depends: ['video'],
-    },
-  );
+    });
+  }
+  catalog.tracks.push({
+    name: SAP_TIMELINE_TRACK,
+    packaging: 'eventtimeline',
+    isLive: true,
+    mimeType: 'application/json',
+    eventType: CMSF_SAP_EVENT_TYPE,
+    depends: ['video'],
+  });
   return new TextEncoder().encode(JSON.stringify(catalog));
 }
 

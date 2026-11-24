@@ -132,11 +132,15 @@ const stopBtn = document.getElementById('stop') as HTMLButtonElement;
 const authEnabled = document.getElementById('auth-enabled') as HTMLInputElement;
 const authProfile = document.getElementById('auth-profile') as HTMLSelectElement;
 const authToken = document.getElementById('auth-token') as HTMLInputElement;
+const sendAudioInput = document.getElementById('send-audio') as HTMLInputElement;
+const sendTimelineInput = document.getElementById('send-timeline') as HTMLInputElement;
 
 function updateAuthorizationControls(busy = false): void {
   authEnabled.disabled = busy;
   authProfile.disabled = busy || !authEnabled.checked;
   authToken.disabled = busy || !authEnabled.checked;
+  sendAudioInput.disabled = busy;
+  sendTimelineInput.disabled = busy;
 }
 authEnabled.addEventListener('change', () => updateAuthorizationControls());
 updateAuthorizationControls();
@@ -187,6 +191,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
     statusEl.textContent = (err as Error).message;
     return;
   }
+  const sendAudio = sendAudioInput.checked;
+  const sendMediaTimeline = sendTimelineInput.checked;
   updateAuthorizationControls(true);
   startCameraBtn.disabled = true;
   startScreenBtn.disabled = true;
@@ -216,8 +222,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       ctx.onCancel(() => { try { cap.stop(); } catch { /* not started */ } });
       capture = cap;
       const stream = source === 'camera'
-        ? await cap.startCamera({ width: 1280, height: 720, frameRate: 30 })
-        : await cap.startScreen({ video: true, audio: false });
+        ? await cap.startCamera({ width: 1280, height: 720, frameRate: 30 }, sendAudio)
+        : await cap.startScreen({ video: true, audio: sendAudio });
       // The tracks only become real HERE — MediaCapture.stop() before this
       // point cannot stop a stream it does not yet hold. Re-adopt the ACQUIRED
       // capture so a permission prompt that resolved AFTER Stop still has its
@@ -233,8 +239,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       fps = settings?.frameRate ?? 30;
       log(`Video: ${width}x${height} @ ${fps}fps`);
 
-      const audioTrack = stream.getAudioTracks()[0];
-      if (audioTrack) {
+      const audioTrack = sendAudio ? stream.getAudioTracks()[0] : undefined;
+      if (!sendAudio) {
+        log('Audio: not sending');
+      } else if (audioTrack) {
         const audioSettings = audioTrack.getSettings();
         audio = {
           sampleRate: audioSettings.sampleRate ?? 48000,
@@ -326,6 +334,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           fps,
           videoBitrate,
           ...(audio ? { audio } : {}),
+          mediaTimeline: sendMediaTimeline,
         },
         publisher: {
           wrapInt: (n) => varint(n),
