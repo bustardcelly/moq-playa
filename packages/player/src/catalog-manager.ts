@@ -25,6 +25,8 @@ import {
     parseMsfCatalog,
     parseDeltaUpdate,
     applyCatalogUpdate,
+    parseMsf02Delta,
+    applyMsf02Delta,
     parseMsf01Delta,
     applyMsf01Delta,
     parseCatalogFormat01,
@@ -46,7 +48,7 @@ export class CatalogManager {
 
     /** Current materialized catalog state. Null until first catalog received. */
     private state: CatalogState | null = null;
-    private _wireFormat: 'msf-00' | 'msf-01' | 'catalogformat-01' | null = null;
+    private _wireFormat: 'msf-00' | 'msf-01' | 'msf-02' | 'catalogformat-01' | null = null;
 
     /** Number of catalog objects processed. */
     private _objectCount = 0;
@@ -215,7 +217,9 @@ export class CatalogManager {
         const text = new TextDecoder().decode(payload);
         const raw: unknown = JSON.parse(text);
 
-        if (Array.isArray(raw)) {
+        if (this.state?.msfDraft === 'draft-02' && typeof raw === 'object' && raw !== null && 'deltaUpdate' in raw) {
+            this.state = applyMsf02Delta(this.state, parseMsf02Delta(payload), this.catalogNamespace);
+        } else if (Array.isArray(raw)) {
             // ── cf01 JSON Patch delta ──────────────────────────────
             if (!this.cf01DeltaSupport || !this.lastRawDocument) {
                 throw new Error(
@@ -292,6 +296,7 @@ export class CatalogManager {
                 this.lastRawDocument = null;
                 this.state = {
                     version: catalog.version,
+                    ...(catalog.msfDraft !== undefined ? { msfDraft: catalog.msfDraft } : {}),
                     tracks: [...catalog.tracks],
                     ...(catalog.generatedAt !== undefined
                         ? { generatedAt: catalog.generatedAt }
@@ -312,7 +317,8 @@ export class CatalogManager {
                         ? { publishTracks: catalog.publishTracks }
                         : {}),
                 };
-                this._wireFormat = typeof obj['version'] === 'number' ? 'msf-00' : 'msf-01';
+                this._wireFormat = catalog.msfDraft === 'draft-02' ? 'msf-02'
+                    : typeof obj['version'] === 'number' ? 'msf-00' : 'msf-01';
             }
         }
 

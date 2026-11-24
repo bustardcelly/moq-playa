@@ -1643,7 +1643,7 @@ describe('MoqtConnection', () => {
       expect(nsSm!.state).toBe('terminated');
     });
 
-    it('routes NAMESPACE_DONE and terminates namespace subscription (§6.1)', async () => {
+    it('routes NAMESPACE_DONE as a suffix withdrawal (d16 §9.23)', async () => {
       const mock = createMockTransport();
       const adapter = await connectAdapter(mock);
 
@@ -1674,7 +1674,14 @@ describe('MoqtConnection', () => {
       await deepFlush();
 
       const nsSm = adapter.session.getNamespaceSubscription(requestId);
-      expect(nsSm!.state).toBe('terminated');
+      expect(nsSm!.state).toBe('active');
+      expect(nsSm!.discoveredNamespaces).toEqual([]);
+      for (const type of ['NAMESPACE', 'NAMESPACE_DONE'] as const) {
+        nsBidi.push(encodeControlMessage({ type, trackNamespaceSuffix: [enc.encode('stream1')] }));
+        await deepFlush();
+        expect(nsSm!.state).toBe('active');
+        expect(nsSm!.discoveredNamespaces).toEqual(type === 'NAMESPACE' ? [[enc.encode('stream1')]] : []);
+      }
     });
 
     it('closes session on unexpected message type on namespace stream', async () => {
@@ -2724,7 +2731,8 @@ describe('MoqtConnection draft-14', () => {
         } as ControlMessage);
 
         // sub1 established on alias 42.
-        const p1 = adapter.subscribeTrack([enc('live')], enc('v1'), { onObject: () => { /* live */ } });
+        // Exercise immediate discard and its terminal alias guard.
+        const p1 = adapter.subscribeTrack([enc('live')], enc('v1'), { terminalDelivery: 'discard', onObject: () => { /* live */ } });
         await deepFlush();
         const req1 = lastSubscribeRequestId(mock, codec);
         mock.pushControlBytes(subscribeOk(req1));
@@ -2775,6 +2783,8 @@ describe('MoqtConnection draft-14', () => {
     const codec = createControlCodec(16);
     const enc = (str: string) => new TextEncoder().encode(str);
     const p = adapter.subscribeTrack([enc('live')], enc('vid'), {
+      // These fixtures exercise local cancellation, including PUBLISH_DONE discard.
+      terminalDelivery: 'discard',
       onObject: (obj: unknown) => { sink?.push(obj); onObject?.(obj); },
     });
     await deepFlush();
@@ -3949,7 +3959,8 @@ describe('MoqtConnection draft-14', () => {
     const codec = createControlCodec(16);
     const enc = (s: string) => new TextEncoder().encode(s);
 
-    const p = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject: () => { /* live */ } });
+    // Exercise immediate discard and its terminal alias guard.
+    const p = adapter.subscribeTrack([enc('live')], enc('vid'), { terminalDelivery: 'discard', onObject: () => { /* live */ } });
     await deepFlush();
     let reqId = -1n;
     for (let i = mock.controlWritten.length - 1; i >= 0; i--) {
@@ -5002,7 +5013,7 @@ describe('MoqtConnection draft-14', () => {
         await Promise.all([firstSettled, secondSettled]);
       });
 
-      it('closeSubgroup PROPAGATES a failed FIN and still releases the stream slot', async () => {
+      it('closeSubgroup PROPAGATES a failed FIN and releases the slot after proven reset', async () => {
         // A caller whose success criterion is "the group reached the peer" —
         // catalog publication announcing readiness — must be able to observe a
         // FIN that failed. Suppressing it lets the app report success for a
@@ -5013,14 +5024,17 @@ describe('MoqtConnection draft-14', () => {
             write() { /* accept the header */ },
             close() { throw new Error('FIN failed: stream reset'); },
           }));
+        const reset = vi.fn(async () => {});
+        Object.assign(mock.transport, { createStreamError: () => new Error('reset'), resetSendStream: reset });
         const adapter = await connectPublisherWithAlias(mock, 42n);
 
         const streamId = await adapter.openSubgroup(varint(42n), varint(0n), varint(0n));
         await expect(adapter.closeSubgroup(streamId)).rejects.toThrow(/FIN failed/);
 
-        // The slot is released regardless, so a retry is a clean no-op rather
-        // than a second (also failing) close of a phantom stream.
+        expect(reset).toHaveBeenCalledOnce();
+        // Proven reset releases the slot, so retry is a no-op and ordinary DONE works.
         await expect(adapter.closeSubgroup(streamId)).resolves.toBeUndefined();
+        await expect(adapter.publishDone(varint(1n), varint(0n), 'failed')).resolves.toBeUndefined();
       });
 
       it('closeSubgroup on an unknown/already-closed stream stays an idempotent no-op', async () => {
@@ -6272,6 +6286,18 @@ describe('terminal drain — review findings (alias reuse, completion race, shut
 // ─── Outbound PUBLISH Forward State (§5.1 / §8.5) ──────────────────────────
 
 describe('outbound PUBLISH forward state (draft-16)', () => {
+  function installEmptyUpdateSource(adapter: MoqtConnection, requestId: bigint): void {
+    // These scenarios produce no Objects; only the exact controlled publisher is empty.
+    const owner = adapter.session.getOutgoingPublish(requestId);
+    if (!owner) throw new Error('Fixture publication unavailable');
+    adapter.setLargestLocationProvider(id => {
+      if (id !== requestId || adapter.session.getOutgoingPublish(id) !== owner || owner.isTerminated) {
+        throw new Error('Fixture publication unavailable');
+      }
+      return null;
+    });
+  }
+
   const enc = (s: string) => new TextEncoder().encode(s);
   const forwardParams = (forward: bigint) => new Map([[MessageParam.FORWARD, [varint(forward)]]]);
 
@@ -6326,6 +6352,7 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
 
   it('a later peer REQUEST_UPDATE with FORWARD=1 reports the resume (§8.5: relay had no subscriber at PUBLISH time)', async () => {
     const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    installEmptyUpdateSource(adapter, requestId);
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: forwardParams(0n),
     } as ControlMessage));
@@ -6371,6 +6398,15 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
     const { adapter, mock, requestId } = await publishedWithChanges();
     const streamId = await adapter.openSubgroup(0n, 0n, 0n);
     await adapter.sendObject(streamId, 0n, new Uint8Array([0x01]));
+    // The source's only admitted Object is the actual 0/0 write above. Paused
+    // submission below is refused and does not advance this publication head.
+    const owner = adapter.session.getOutgoingPublish(requestId)!;
+    adapter.setLargestLocationProvider(id => {
+      if (id !== requestId || adapter.session.getOutgoingPublish(id) !== owner || owner.isTerminated) {
+        throw new Error('Fixture publication unavailable');
+      }
+      return { group: 0n, object: 0n };
+    });
 
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: forwardParams(0n),
@@ -6416,6 +6452,7 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
 
   it('reports a pause before waiting for the REQUEST_OK write', async () => {
     const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    installEmptyUpdateSource(adapter, requestId);
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
     } as ControlMessage));
@@ -6437,6 +6474,7 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
 
   it('queues REQUEST_OK before a pause observer terminalizes the publish', async () => {
     const { adapter, mock, requestId } = await publishedWithChanges();
+    installEmptyUpdateSource(adapter, requestId);
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
     } as ControlMessage));
@@ -6461,6 +6499,7 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
 
   it('contains a throwing Forward State observer and keeps processing updates', async () => {
     const { adapter, mock, requestId } = await publishedWithChanges();
+    installEmptyUpdateSource(adapter, requestId);
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
     } as ControlMessage));
@@ -6489,6 +6528,7 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
 
   it('reports and contains a rejected async Forward State observer', async () => {
     const { adapter, mock, requestId } = await publishedWithChanges();
+    installEmptyUpdateSource(adapter, requestId);
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
     } as ControlMessage));

@@ -288,8 +288,8 @@ export interface PartialGroupAbandonedEvent {
  * Player-level recovery actions, layered on top of the pipeline's
  * {@link RecoveryAction} union:
  *
- * - `jump_to_live` — persistent stalls flushed the backlog and resubscribed
- *   from the live edge.
+ * - `jump_to_live` — stalls resubscribed from live, or excess live LOC latency
+ *   advanced the shared timeline and flushed queued output.
  * - `track_restart` — the media-liveness ladder restarted a starved track's
  *   delivery (REQUEST_UPDATE refresh or full resubscribe).
  * - `track_resubscribe` — the publisher ended the subscription for a reason
@@ -299,7 +299,11 @@ export interface PartialGroupAbandonedEvent {
  */
 export type PlayerRecoveryAction =
   | RecoveryAction
-  | { readonly type: 'jump_to_live' }
+  | { readonly type: 'jump_to_live';
+    /** Cause, when known; omitted by legacy emitters. */
+    readonly trigger?: 'stalls' | 'latency';
+    /** Timeline advance in milliseconds, when known. */
+    readonly byMs?: number }
   | {
     readonly type: 'track_restart';
     readonly mediaType: 'video' | 'audio';
@@ -475,7 +479,9 @@ export interface QualitySwitchFailedEvent {
  * Live catch-up state changed — activated, rate adjusted, or deactivated.
  *
  * Emitted when the player adjusts playback rate to catch up to the live
- * edge, or when catch-up deactivates after reaching the target latency.
+ * edge, or when catch-up deactivates or loses its live output owner.
+ * latencyMs is measured latency when available, otherwise standing buffer ahead;
+ * an explicit stop retains the last reading. targetMs is the configured/catalog target.
  *
  * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
  * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for latency measurement)
@@ -502,8 +508,8 @@ export interface NamespaceDiscoveredEvent {
 }
 
 /**
- * Namespace discovery completed (NAMESPACE_DONE received).
- * @see draft-ietf-moq-transport-16 §9.25
+ * A namespace suffix was withdrawn (NAMESPACE_DONE received).
+ * @see draft-ietf-moq-transport-16 §9.23
  */
 export interface NamespaceDoneEvent {
   readonly type: 'namespace_done';
@@ -595,6 +601,8 @@ export interface DurationChangedEvent {
  */
 export interface SapEventReceivedEvent {
   readonly type: 'sap_event';
+  /** MSF-02 §8.1 header bytes; absent when no header was provided. */
+  readonly header?: Uint8Array;
   /** Name of the SAP timeline track in the catalog. */
   readonly trackName: string;
   /** The SAP timeline entries parsed from this object. */
@@ -612,6 +620,8 @@ export interface SapEventReceivedEvent {
  */
 export interface EventTimelineReceivedEvent {
   readonly type: 'event_timeline';
+  /** MSF-02 §8.1 header bytes; absent when no header was provided. */
+  readonly header?: Uint8Array;
   /** Name of the eventtimeline track in the catalog. */
   readonly trackName: string;
   /** EventType URI from the catalog (§5.1.13). */

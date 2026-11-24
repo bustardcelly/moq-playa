@@ -34,6 +34,9 @@ export type {
     CmsfUrlRef,
     CmsfDrmSystem,
     CmsfContentProtection,
+    Msf02Delta,
+    Msf02DeltaOp,
+    Msf02DeltaOpKind,
     Msf01Delta,
     Msf01DeltaOp,
     Msf01DeltaOpKind,
@@ -52,7 +55,7 @@ export type { Cf01ParseResult } from './catalog-cf01.js';
 // Auto-detect dispatcher
 export { parseCatalogAuto } from './catalog-detect.js';
 // MSF-01 op-array delta dialect (draft-ietf-moq-msf-01 §5.3)
-export { parseMsf01Delta, applyMsf01Delta } from './catalog-delta-msf01.js';
+export { parseMsf01Delta, applyMsf01Delta, parseMsf02Delta, applyMsf02Delta } from './catalog-delta-msf01.js';
 
 // ─── Catalog builder (publisher) ────────────────────────────────────
 
@@ -65,7 +68,7 @@ export { parseDeltaUpdate, applyCatalogUpdate } from './delta.js';
 
 // ─── Track selection ─────────────────────────────────────────────────
 
-export { groupByRender, groupByAlt, selectVideoAltGroup, selectTrack, resolveDependencies, isTrackPackagingSupported } from './selection.js';
+export { groupByRender, groupByAlt, selectVideoAltGroup, selectTrack, resolveDependencies, resolveTrackDependencies, isTrackPackagingSupported } from './selection.js';
 export {
     fieldsFromCatalogText, namespaceDisplay, contextFields, resolveTrackNamespace,
     identityKey, trackIdentityKey, namespaceFieldsOf, sameNamespaceFields,

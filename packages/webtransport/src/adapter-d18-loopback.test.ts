@@ -14,6 +14,26 @@ import { SessionState, ForwardState, varint, SessionError, RequestError18, decod
 const codec18 = createControlCodec(18);
 import type { MoqtObject, ControlMessage, Goaway, RequestErrorMsg } from '@openmoq/transport';
 
+/** Install only the metadata this fixture owns; unknown or replaced owners are unavailable. */
+function fixturePublicationHead(
+  connection: MoqtConnection,
+  requestId: bigint,
+  head: { group: bigint; object: bigint } | null,
+  direction: 'incoming' | 'outgoing' = 'incoming',
+): void {
+  const current = () => direction === 'incoming'
+    ? connection.session.getIncomingSubscription(requestId)
+    : connection.session.getOutgoingPublish(requestId);
+  const owner = current();
+  if (!owner) throw new Error('Fixture publication owner unavailable');
+  connection.setLargestLocationProvider(id => {
+    if (id !== requestId || current() !== owner || owner.isTerminated) {
+      throw new Error('Fixture publication owner unavailable');
+    }
+    return head ? { ...head } : null;
+  });
+}
+
 describe('MoqtConnection(18) loopback — SETUP handshake', () => {
   it('client and server both reach ESTABLISHED via the uni SETUP pair', async () => {
     const { client, server, a, b, errors } = await connectedPair();
@@ -149,6 +169,8 @@ describe('MoqtConnection(18) loopback — peer REQUEST_UPDATE on outbound PUBLIS
     const outPub = client.session.getOutgoingPublish(requestId);
     expect(outPub?.forwardState).toBe(ForwardState.ACTIVE); // established, forwarding
 
+    // This owned publisher has produced no objects.
+    fixturePublicationHead(client, requestId, null, 'outgoing');
     // Peer sends REQUEST_UPDATE (FORWARD=0 → pause) on the SAME PUBLISH stream.
     const updates: ControlMessage[] = [];
     client.onMessage = (m) => updates.push(m);
@@ -414,7 +436,7 @@ describe('MoqtConnection(18) loopback — §5.1 pending SUBSCRIBE superseded by 
 });
 
 describe('MoqtConnection(18) loopback — outbound PUBLISH lifecycle (data + PUBLISH_DONE)', () => {
-  it.each([14, 16, 18, 22] as const)('draft %s exposes end-of-group subgroup evidence on every data object before FIN', async (draft) => {
+  it.each([14, 16, 18, 22, 23] as const)('draft %s exposes end-of-group subgroup evidence on every data object before FIN', async (draft) => {
     const { client, server, errors } = await connectedPair(draft);
     const received: MoqtObject[] = [];
     let requestId = -1n;
@@ -719,8 +741,12 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     return { ...pair, subReqId, reqId, clientMsgs };
   }
   async function pausePair(pair: Awaited<ReturnType<typeof activePair>>): Promise<void> {
+    // The source still owns the head advertised at establishment. Setup pause
+    // succeeds; the subsequent resume deliberately loses its metadata source.
+    fixturePublicationHead(pair.server, pair.subReqId, { group: 5n, object: 1n });
     await pair.client.requestUpdate(pair.reqId, { forward: 0 });
     await flush();
+    pair.server.setLargestLocationProvider(() => { throw new Error('Fixture publication source unavailable'); });
   }
   const doneMsgs = (msgs: ControlMessage[]) => msgs.filter((m) => m.type === 'PUBLISH_DONE') as Array<{ statusCode: bigint }>;
 
@@ -1089,8 +1115,12 @@ describe('MoqtConnection(18) loopback — publisher terminalization ownership', 
     return { ...pair, subReqId, reqId, clientMsgs };
   }
   async function pausePair22(pair: Awaited<ReturnType<typeof activePair22>>): Promise<void> {
+    // The source still owns the head advertised at establishment. Setup pause
+    // succeeds; the subsequent resume deliberately loses its metadata source.
+    fixturePublicationHead(pair.server, pair.subReqId, { group: 5n, object: 1n });
     await pair.client.requestUpdate(pair.reqId, { forward: 0 });
     await flush();
+    pair.server.setLargestLocationProvider(() => { throw new Error('Fixture publication source unavailable'); });
   }
   type Internals = {
     outgoingStreams: Map<bigint, { writer: { abort(e?: unknown): Promise<void>; write(b: unknown): Promise<void> }; subscriptionRequestId?: bigint }>;
@@ -1372,6 +1402,8 @@ describe('MoqtConnection(18) loopback — terminal-alias guard delivery timeout 
 
     // A REQUEST_UPDATE raising the object delivery timeout is STAGED, not committed
     // at send — it applies only when the peer's REQUEST_OK arrives (§10.9 / finding).
+    // No objects are published in this fixture; emptiness belongs to this exact owner.
+    fixturePublicationHead(server, subReqId, null);
     await client.requestUpdate(sub.requestId, { objectDeliveryTimeout: varint(60_000n) });
     await flush(16); // let REQUEST_OK round-trip and commit
     expect(client.session.getSubscription(sub.requestId)?.requestedDeliveryTimeoutMs).toBe(60_000);
@@ -1390,12 +1422,15 @@ describe('MoqtConnection(18) loopback — terminal-alias guard delivery timeout 
       const { client, server } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 1_000 } });
       let subReqId = -1n;
       server.onSubscribe = (rid) => { subReqId = rid; };
-      const subP = client.subscribeTrack(ns('live'), nm('vid'), { onObject: () => { /* none */ } });
+      // Exercise immediate discard and its terminal alias guard.
+      const subP = client.subscribeTrack(ns('live'), nm('vid'), { terminalDelivery: 'discard', onObject: () => { /* none */ } });
       await flush();
       await server.acceptSubscribe(subReqId, 9n); // no initial timeout
       await flush();
       const sub = await subP;
       // Commit a 60s object timeout (REQUEST_UPDATE → REQUEST_OK).
+      // No objects are published in this fixture; emptiness belongs to this exact owner.
+      fixturePublicationHead(server, subReqId, null);
       await client.requestUpdate(sub.requestId, { objectDeliveryTimeout: varint(60_000n) });
       await flush(16);
 
@@ -1783,6 +1818,7 @@ describe('MoqtConnection(18) loopback — joining FETCH (§10.12.2)', () => {
 
   it('settle-time gate honors a REQUEST_UPDATE Forward=1 that lands before accept (§10.12.2 pending updates first)', async () => {
     const { client, server, errors } = await connectedPair();
+    server.setLargestLocationProvider(() => null); // This fixture has sent no Objects.
     const fetches: bigint[] = [];
     server.onFetch = (rid) => { fetches.push(rid); };
     const clientErrors: RequestErrorMsg[] = [];
@@ -1858,6 +1894,7 @@ describe('MoqtConnection(18) loopback — joining FETCH (§10.12.2)', () => {
 
   it('RESPONSE ORDER on the wire: exactly [SUBSCRIBE_OK, REQUEST_OK] (§10.8)', async () => {
     const { client, server, a, errors } = await connectedPair();
+    server.setLargestLocationProvider(() => null); // This fixture has sent no Objects.
     const subReqId = await client.subscribe(ns('live'), nm('vid'), { forward: ForwardState.PAUSED });
     await flush();
     await client.requestUpdate(subReqId, { forward: true });
@@ -1873,6 +1910,7 @@ describe('MoqtConnection(18) loopback — joining FETCH (§10.12.2)', () => {
 
   it('RESPONSE ORDER with multiple pending updates: [SUBSCRIBE_OK, REQUEST_OK, REQUEST_OK] FIFO', async () => {
     const { client, server, a, errors } = await connectedPair();
+    server.setLargestLocationProvider(() => null); // This fixture has sent no Objects.
     const subReqId = await client.subscribe(ns('live'), nm('vid'), { forward: ForwardState.PAUSED });
     await flush();
     await client.requestUpdate(subReqId, { forward: true });
@@ -1889,6 +1927,7 @@ describe('MoqtConnection(18) loopback — joining FETCH (§10.12.2)', () => {
 
   it('REJECTING a pending SUBSCRIBE with a deferred update leaves the client ESTABLISHED (stream FIN, no close)', async () => {
     const { client, server, a, errors } = await connectedPair();
+    server.setLargestLocationProvider(() => null); // This fixture has sent no Objects.
     const subReqId = await client.subscribe(ns('live'), nm('vid'));
     await flush();
     await client.requestUpdate(subReqId, { forward: false });
@@ -2256,7 +2295,8 @@ describe('MoqtConnection(18) loopback — coalesced reads, terminal PUBLISH_DONE
 
   it('receiver of PUBLISH_DONE takes the early-discard path: STOP_SENDING on the subscription\'s open data streams', async () => {
     const { client, server, a, b, errors } = await connectedPair();
-    const subReqId = await client.subscribe(ns('live'), nm('vid'));
+    // Exercise immediate discard and its terminal alias guard.
+    const subReqId = await client.subscribe(ns('live'), nm('vid'), { terminalDelivery: 'discard' });
     await flush();
     await server.acceptSubscribe(subReqId, 7n);
     await flush();
@@ -2295,7 +2335,8 @@ describe('MoqtConnection(18) loopback — terminal-lifecycle interleavings', () 
     const pair = await connectedPair(18, opts);
     const seen: ControlMessage[] = [];
     pair.client.onMessage = (m) => seen.push(m);
-    const subReqId = await pair.client.subscribe(ns('live'), nm('vid'));
+    // Exercise immediate discard and its terminal alias guard.
+    const subReqId = await pair.client.subscribe(ns('live'), nm('vid'), { terminalDelivery: 'discard' });
     await flush();
     await pair.server.acceptSubscribe(subReqId, 7n);
     await flush();
@@ -2634,7 +2675,8 @@ describe('MoqtConnection(18) loopback — receiver terminal/alias lifecycle', ()
     const { client, server, a, b, errors } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 10_000 } });
     const d1: string[] = [];
     let rid1 = -1n; server.onSubscribe = (r) => { rid1 = r; };
-    const p1 = client.subscribeTrack(ns('live'), nm('v1'), { onObject: (o) => d1.push(`${o.groupId}:${o.objectId}`) });
+    // Exercise immediate discard and its terminal alias guard.
+    const p1 = client.subscribeTrack(ns('live'), nm('v1'), { terminalDelivery: 'discard', onObject: (o) => d1.push(`${o.groupId}:${o.objectId}`) });
     await flush();
     await server.acceptSubscribe(rid1, 7n);
     await p1;
@@ -2715,7 +2757,8 @@ describe('MoqtConnection(18) loopback — receiver terminal/alias lifecycle', ()
 
   async function acceptedForReceiver(clientOptions?: { terminatedAliasTtlMs?: number }) {
     const pair = await connectedPair(18, { clientOptions });
-    const subReqId = await pair.client.subscribe(ns('live'), nm('vid'));
+    // Exercise immediate discard and its terminal alias guard.
+    const subReqId = await pair.client.subscribe(ns('live'), nm('vid'), { terminalDelivery: 'discard' });
     await flush();
     await pair.server.acceptSubscribe(subReqId, 7n);
     await flush();
@@ -2849,7 +2892,8 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     it(`alias reuse while an incomplete old generation (${kind}) is still guarded is REFUSED — never bound, never misdelivered`, async () => {
       const { client, server, a, b, errors } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 10_000 } });
       let rid1 = -1n; server.onSubscribe = (r) => { rid1 = r; };
-      const p1 = client.subscribeTrack(ns('live'), nm('v1'), { onObject: () => { /* sub1 */ } });
+      // Exercise immediate discard and its terminal alias guard.
+      const p1 = client.subscribeTrack(ns('live'), nm('v1'), { terminalDelivery: 'discard', onObject: () => { /* sub1 */ } });
       await flush();
       await server.acceptSubscribe(rid1, 7n);
       await p1;

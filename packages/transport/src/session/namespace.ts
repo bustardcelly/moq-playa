@@ -7,15 +7,16 @@
  * State transitions:
  * - PENDING: SUBSCRIBE_NAMESPACE sent/received, awaiting REQUEST_OK or REQUEST_ERROR
  * - ACTIVE: REQUEST_OK exchanged, receiving/sending NAMESPACE messages
- * - TERMINATED: REQUEST_ERROR received or NAMESPACE_DONE sent/received
+ * - TERMINATED: REQUEST_ERROR or local subscription teardown
  *
  * The subscriber discovers namespaces matching their prefix via NAMESPACE messages.
- * The publisher announces matching namespaces until sending NAMESPACE_DONE.
+ * NAMESPACE_DONE withdraws a suffix; the subscription continues (d18 §10.18).
  *
  * @see draft-ietf-moq-transport-16 §6.1
  * @module
  */
 
+import { isDraft23, type DraftVersion } from '../versions.js';
 import { NamespaceState, type NamespaceStateValue } from './types.js';
 
 /**
@@ -42,7 +43,16 @@ export class NamespaceStateMachine {
    * the subscriber applies it on REQUEST_OK, the publisher applies it when it
    * accepts the peer's update. Recomputes the prefix key.
    */
-  updatePrefix(newPrefix: Uint8Array[]): void {
+  updatePrefix(newPrefix: Uint8Array[], draft: DraftVersion = 18): void {
+    // Draft 23 §9.5.2: rebase retained names and implicitly withdraw exclusions.
+    // Older drafts retain the existing suffix behavior when no draft is supplied.
+    if (isDraft23(draft)) {
+      this._discoveredNamespaces = this._discoveredNamespaces.flatMap(suffix => {
+        const full = [...this._namespacePrefix, ...suffix];
+        return this.suffixEquals(full.slice(0, newPrefix.length), newPrefix)
+          ? [full.slice(newPrefix.length)] : [];
+      });
+    }
     this._namespacePrefix = newPrefix;
     this._prefixKey = this.computePrefixKey(newPrefix);
   }
@@ -198,7 +208,7 @@ export class NamespaceStateMachine {
   }
 
   /**
-   * Handle NAMESPACE_DONE received (subscriber side).
+   * Terminate discovery on stream closure or cancellation (subscriber side).
    * Transitions from ACTIVE to TERMINATED.
    */
   handleNamespaceDone(): void {
@@ -247,7 +257,7 @@ export class NamespaceStateMachine {
   }
 
   /**
-   * Send NAMESPACE_DONE (publisher side).
+   * Terminate local discovery (publisher side); wire DONE uses withdrawNamespace.
    * Transitions from ACTIVE to TERMINATED.
    */
   sendNamespaceDone(): void {

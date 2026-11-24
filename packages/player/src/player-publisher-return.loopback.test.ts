@@ -9,9 +9,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createControlCodec, varint, RequestError, type ControlMessage } from '@openmoq/transport';
 import { MoqtConnection } from '@openmoq/webtransport';
-import type { PlayerError } from './errors.js';
+import { PlayerErrorCode, type PlayerError } from './errors.js';
 import { MoqtPlayer } from './player.js';
-import type { AudioDecoderLike, AudioOutputLike } from './interfaces.js';
+import { videoInit } from '../../locmaf/test-support/cmaf.js';
+import type { MediaSourceLike, AudioDecoderLike, AudioOutputLike } from './interfaces.js';
+import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { createLoopback, flush } from '../../webtransport/src/testkit/loopback.js';
 
 const decoder = new TextDecoder();
@@ -491,4 +493,567 @@ describe('issue #52 legacy drafts: provenance of the Retry Interval', () => {
       expect(f.recovery.length).toBe(restarts);
     } finally { await f.close(); }
   });
+});
+
+// Opt-in announcement recovery; MSE output is modeled, not browser playback.
+async function announcedPlayer(draft: 14 | 16 | 18 | 22, enabled = true, refused = false, mse = false, monitor = true) {
+  const { a, b } = createLoopback();
+  const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
+  const codec = createControlCodec(draft), isolated = createLoopback().a;
+  let namespaceOptions: bigint | undefined;
+  const requests: bigint[] = [], arrivals: number[] = [], watches: bigint[] = [];
+  server.onSubscribe = id => { requests.push(id); };
+  server.onSubscribeNamespace = id => { watches.push(id); };
+  // Legacy namespace serving is not implemented by the SDK. Inject only that
+  // peer protocol; media and the player still traverse the real adapters.
+  if (draft === 16) {
+    const open = a.createBidirectionalStream.bind(a);
+    vi.spyOn(a, 'createBidirectionalStream').mockImplementation(() =>
+      a.bidiOut.length ? isolated.createBidirectionalStream() : open());
+    const subscribe = client.subscribeNamespace.bind(client);
+    vi.spyOn(client, 'subscribeNamespace').mockImplementation(async (...args) => {
+      const id = await subscribe(...args); watches.push(id);
+      const chunks = isolated.bidiOut.at(-1)!.out.written;
+      const wire = Uint8Array.from(chunks.flatMap(chunk => [...chunk]));
+      const message = codec.decode(wire, 0).message;
+      expect(message.type).toBe('SUBSCRIBE_NAMESPACE');
+      if (message.type === 'SUBSCRIBE_NAMESPACE') namespaceOptions = message.subscribeOptions;
+      return id;
+    });
+  } else if (draft === 14) {
+    const handle = server.session.handleControlMessage.bind(server.session);
+    vi.spyOn(server.session, 'handleControlMessage').mockImplementation(msg => {
+      if (msg.type === 'SUBSCRIBE_NAMESPACE') {
+        watches.push(msg.requestId);
+        // Account for the legacy peer's sequential request-ID allocation.
+        (server.session as unknown as { validateAndReplenish(id: bigint): unknown }).validateAndReplenish(msg.requestId);
+        return [];
+      }
+      return handle(msg);
+    });
+  }
+  const source: MediaSourceLike = { initialize: () => true, appendChunk: vi.fn(), reset() {},
+    endOfStream() {}, destroy() {}, mediaElement: null, onFirstFrame: null, onError: null, onStall: null };
+  const player = new MoqtPlayer({
+    url: 'https://relay.invalid/moq', namespace: 'live', draftVersion: draft,
+    ...(enabled ? { publisherWaitMs: 20_000 } : {}),
+    createConnection: () => client,
+    createTransport: async () => { void server.connect(b, { maxRequestId: varint(1_000_000) }).catch(() => {}); return a; },
+    catalog: { version: 1, tracks: [{ name: 'video', role: 'video', packaging: mse ? 'cmaf' : 'loc', isLive: true,
+      ...(mse ? { initData: Buffer.from(videoInit()).toString('base64') } : {}),
+      codec: 'avc1.640028', width: 10, height: 10, renderGroup: 1 }] },
+    ...(mse ? { createMediaSource: () => source } : {}),
+    createCmafAssembler: callbacks => ({
+      push: (mediaType, track, group, payload) => callbacks.onSegment(mediaType, payload, track, group),
+      getEpoch: () => null, reset() {}, destroy() {},
+    }),
+    disableAudio: true, autoQuality: false, ...(monitor ? {} : { livenessTimeoutMs: 0 }),
+  });
+  player.on('media_object', e => { if (e.mediaType === 'video') arrivals.push(performance.now()); });
+  await player.load(); await flush(128);
+  let published: bigint | undefined;
+  async function announce(done = false) {
+    if (!watches.length || refused) return;
+    if (draft === 14) {
+      if (done) await server.publishNamespaceDone(published!);
+      else published = await server.publishNamespace([new TextEncoder().encode('live')]);
+    } else if (draft === 16) {
+      if (namespaceOptions !== 1n && namespaceOptions !== 2n) return;
+      isolated.bidiOut[0]!.in.injectRead(codec.encode({ type: done ? 'NAMESPACE_DONE' : 'NAMESPACE', trackNamespaceSuffix: [] }));
+    } else if (done) await server.sendNamespaceDone(watches[0]!, []);
+    else await server.sendNamespace(watches[0]!, []);
+    await flush(128);
+  }
+  if (watches.length) {
+    if (draft === 14 || draft === 16) {
+      const pipe = draft === 14 ? a.bidiOut[0]!.in : isolated.bidiOut[0]!.in;
+      pipe.injectRead(refused ? codec.encode({ type: 'REQUEST_ERROR', requestId: varint(watches[0]!),
+        errorCode: varint(1), errorReason: 'unavailable', retryInterval: varint(0), requestKind: 'SUBSCRIBE_NAMESPACE' })
+        : draft === 14 ? Uint8Array.of(0x12, 0, 1, Number(watches[0]!))
+        : codec.encode({ type: 'REQUEST_OK', requestId: varint(watches[0]!), parameters: new Map() }));
+    } else if (refused) await server.rejectSubscribeNamespace(watches[0]!, 1n, 'unavailable');
+    else await server.acceptSubscribeNamespace(watches[0]!);
+    await flush(128); await announce();
+  }
+  await server.acceptSubscribe(requests[0]!, 50n); await flush(128); player.play();
+  const stream = await server.openSubgroup(50n, 0n, 0n);
+  await server.sendObject(stream, 0n, Uint8Array.of(1)); await flush(128); player.tick();
+  if (mse) source.onFirstFrame?.();
+  expect(arrivals).toHaveLength(1);
+  server.setLargestLocationProvider(() => ({ group: 0n, object: 0n }));
+  return { a, player, client, server, requests, arrivals, watches, stream, namespaceOptions,
+    announce,
+    async advance(ms: number) { await vi.advanceTimersByTimeAsync(ms); await flush(128); player.tick(); },
+    async close() { await player.destroy(); await client.close(); await server.close(); },
+  };
+}
+
+describe.each([14, 16, 18, 22] as const)('publisher return draft %i', draft => {
+  it.each([false, true])('resumes within one second of a re-announcement during the old recovery probe (MSE=%s)', async mse => {
+    const f = await announcedPlayer(draft, true, false, mse);
+    try {
+      await f.announce(true); await f.advance(12_000);
+      const returned = performance.now(); await f.announce();
+      for (let elapsed = 0; f.requests.length < 2 && elapsed < 1000; elapsed += 50) await f.advance(50);
+      expect(f.requests).toHaveLength(2);
+      await f.server.acceptSubscribe(f.requests[1]!, 60n); await flush(128);
+      const stream = await f.server.openSubgroup(60n, 1n, 0n);
+      await f.server.sendObject(stream, 0n, Uint8Array.of(2)); await flush(128);
+      expect(f.arrivals).toHaveLength(2);
+      expect(f.arrivals[1]! - returned).toBeLessThan(1000);
+      await f.advance(5000); expect(f.requests).toHaveLength(2); expect(f.watches).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it.each(['off', 'refused'] as const)('preserves the original ladder when discovery is %s', async mode => {
+    const f = await announcedPlayer(draft, mode !== 'off', mode === 'refused');
+    try {
+      await f.advance(12_000); expect(f.requests).toHaveLength(1);
+      await f.advance(10_000); expect(f.requests).toHaveLength(2);
+      expect(f.watches).toHaveLength(mode === 'off' ? 0 : 1);
+    } finally { await f.close(); }
+  });
+
+  it('leaves a route that received after withdrawal alone', async () => {
+    const f = await announcedPlayer(draft);
+    try {
+      expect(f.requests).toHaveLength(1); await f.announce(true);
+      await f.server.sendObject(f.stream, 1n, Uint8Array.of(2)); await flush(128);
+      await f.announce(); await f.advance(500);
+      expect(f.arrivals).toHaveLength(2); expect(f.requests).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it('does not send a second SUBSCRIBE on a timer after announcement refusal', async () => {
+    const f = await announcedPlayer(draft);
+    try {
+      await f.announce(true); await f.announce(); await f.advance(50);
+      expect(f.requests).toHaveLength(2);
+      await f.server.rejectSubscribe(f.requests[1]!, 0x10n, 'gone'); await flush(128);
+      await f.advance(25_000); expect(f.requests).toHaveLength(2);
+    } finally { await f.close(); }
+  });
+});
+
+
+describe.each([18, 22] as const)('publisher discovery ownership draft %i', draft => {
+  it('surfaces PREFIX_OVERLAP for an application namespace subscription', async () => {
+    const f = await announcedPlayer(draft);
+    const messages: unknown[] = [];
+    const observe = f.client.onMessage;
+    f.client.onMessage = msg => { messages.push(msg); observe?.(msg); };
+    try {
+      const id = await f.player.subscribeNamespace('live'); await flush(128);
+      expect(messages).toContainEqual(expect.objectContaining({ type: 'REQUEST_ERROR', requestId: id, errorCode: 0x30n }));
+      expect(f.watches).toHaveLength(1); expect(f.client.session.state).toBe('established');
+    } finally { await f.close(); }
+  });
+
+  it('disables the watch for the session after its stream ends', async () => {
+    const f = await announcedPlayer(draft);
+    try {
+      expect(f.watches).toHaveLength(1); await f.announce(true);
+      // Peer FIN retires the watch; no replacement watch is opened.
+      const contexts = (f.server as unknown as { inboundRequestContexts: Map<bigint, { terminate(): Promise<void> }> }).inboundRequestContexts;
+      await contexts.get(f.watches[0]!)!.terminate(); await flush(128);
+      expect(f.client.session.getNamespaceSubscription(f.watches[0]!)).toBeUndefined();
+      await f.advance(12_000); expect(f.requests).toHaveLength(1); expect(f.watches).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+});
+
+
+it('replaces once on the announcement even with timer-based liveness disabled', async () => {
+  const f = await announcedPlayer(18, true, false, false, false);
+  try {
+    await f.announce(true); await f.advance(30_000); expect(f.requests).toHaveLength(1);
+    await f.announce(); await flush(128); expect(f.requests).toHaveLength(2);
+    await f.server.acceptSubscribe(f.requests[1]!, 60n); await flush(128);
+    const stream = await f.server.openSubgroup(60n, 1n, 0n);
+    await f.server.sendObject(stream, 0n, Uint8Array.of(2)); await flush(128);
+    expect(f.arrivals).toHaveLength(2);
+    await f.advance(30_000); expect(f.requests).toHaveLength(2);
+  } finally { await f.close(); }
+});
+
+
+it.each([0x10n, 1n])('a new announcement only exempts a DOES_NOT_EXIST zero retry refusal (code=%s)', async code => {
+  const f = await announcedPlayer(18);
+  try {
+    await f.announce(true); await f.announce(); await f.advance(50);
+    expect(f.requests).toHaveLength(2);
+    await f.server.rejectSubscribe(f.requests[1]!, code, 'refused'); await flush(128);
+    await f.announce(true); await f.announce(); await f.advance(50);
+    expect(f.requests).toHaveLength(code === 0x10n ? 3 : 2);
+  } finally { await f.close(); }
+});
+
+it('honors a positive media Retry Interval even on a new announcement', async () => {
+  const f = await announcedPlayer(18);
+  try {
+    await f.announce(true); await f.announce(); await f.advance(50);
+    expect(f.requests).toHaveLength(2);
+    f.a.bidiOut.at(-1)!.in.injectRead(createControlCodec(18).encode({ type: 'REQUEST_ERROR',
+      requestId: varint(f.requests[1]!), errorCode: varint(0x10), retryInterval: varint(10_001), errorReason: 'not yet' })); await flush(128);
+    await f.announce(true); await f.announce(); await f.advance(1000);
+    expect(f.requests).toHaveLength(2);
+  } finally { await f.close(); }
+});
+
+// Initial catalog wait uses the same accepted session watch.
+async function waiting(draft: 18 | 22, mode: 'accepted' | 'refused' | 'off' | 'pending' = 'accepted', holdWatch = false) {
+  const pair = await connectedPair(draft);
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  if (holdWatch) {
+    const subscribe = pair.client.subscribeNamespace.bind(pair.client);
+    vi.spyOn(pair.client, 'subscribeNamespace').mockImplementation(async (...args) => {
+      const id = await subscribe(...args); await held; return id;
+    });
+  }
+  const requests: Array<{ id: bigint; name: string }> = [], watches: bigint[] = [], errors: string[] = [];
+  pair.server.onSubscribe = (id, _ns, name) => { requests.push({ id, name: new TextDecoder().decode(name) }); };
+  pair.server.onSubscribeNamespace = id => {
+    watches.push(id);
+    if (mode === 'refused') void pair.server.rejectSubscribeNamespace(id, 1n, 'unavailable');
+    else if (mode !== 'pending') void pair.server.acceptSubscribeNamespace(id);
+  };
+  const player = new MoqtPlayer({ connection: pair.client as unknown as MoqtConnection, url: 'https://relay.invalid/moq', namespace: 'live',
+    catalogBootstrap: 'subscribe', publisherWaitMs: mode === 'off' ? 0 : 20_000, disableAudio: true, autoQuality: false });
+  player.on('error', e => { if (e.error.severity === 'fatal') errors.push(e.error.message); });
+  await player.load(); await flush(128);
+  const catalogs = () => requests.filter(r => r.name === 'catalog');
+  return { ...pair, player, requests, watches, errors, catalogs,
+    async refuse(code = 0x10n, interval = 0n) {
+      if (interval === 0n) await pair.server.rejectSubscribe(catalogs().at(-1)!.id, code, 'unroutable');
+      else pair.a.bidiOut.at(-1)!.in.injectRead(createControlCodec(draft).encode({ type: 'REQUEST_ERROR',
+        requestId: varint(catalogs().at(-1)!.id), errorCode: varint(code), retryInterval: varint(interval), errorReason: 'unroutable' }));
+      await flush(128);
+    },
+    async announce() { await pair.server.sendNamespace(watches[0]!, []); await flush(128); },
+    async advance(ms: number) { await vi.advanceTimersByTimeAsync(ms); await flush(128); },
+    async close() { release(); await player.destroy(); await pair.client.close(); await pair.server.close(); },
+  };
+}
+
+describe.each([18, 22] as const)('announced catalog draft %i', draft => {
+  it('waits beyond the old watchdog, then re-subscribes once and delivers media', async () => {
+    const f = await waiting(draft);
+    const arrivals: unknown[] = [];
+    f.player.on('media_object', event => { arrivals.push(event); });
+    try {
+      await f.refuse(); await f.advance(12_000);
+      expect(f.errors).toEqual([]); expect(f.catalogs()).toHaveLength(1);
+      await f.announce(); expect(f.catalogs()).toHaveLength(2);
+      await f.server.sendNamespaceDone(f.watches[0]!, []); await f.announce();
+      expect(f.catalogs()).toHaveLength(2);
+      await f.server.acceptSubscribe(f.catalogs()[1]!.id, 50n); await flush(128);
+      const catalog = await f.server.openSubgroup(50n, 0n, 0n);
+      await f.server.sendObject(catalog, 0n, new TextEncoder().encode(JSON.stringify({ version: 1, tracks: [
+        { name: 'video', role: 'video', packaging: 'loc', isLive: true, codec: 'avc1.640028', width: 10, height: 10, renderGroup: 1 },
+      ] }))); await flush(256);
+      const media = f.requests.find(r => r.name === 'video'); expect(media).toBeDefined();
+      await f.server.acceptSubscribe(media!.id, 60n); await flush(128); f.player.play();
+      const stream = await f.server.openSubgroup(60n, 0n, 0n);
+      await f.server.sendObject(stream, 0n, Uint8Array.of(1)); await flush(128);
+      expect(arrivals).toHaveLength(1); expect(f.player.state).toBe('playing');
+      await f.advance(8001); expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it('expires at the bound without polling', async () => {
+    const f = await waiting(draft);
+    try {
+      await f.refuse(); await f.advance(19_999); expect(f.errors).toEqual([]);
+      await f.advance(1); expect(f.errors).toHaveLength(1); expect(f.player.state).toBe('error');
+      expect(f.catalogs()).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it.each(['off', 'refused'] as const)('keeps the immediate fatal refusal when discovery is %s', async mode => {
+    const f = await waiting(draft, mode);
+    try { await f.refuse(); expect(f.player.state).toBe('error'); expect(f.catalogs()).toHaveLength(1); }
+    finally { await f.close(); }
+  });
+
+  it('keeps other catalog refusal codes fatal immediately', async () => {
+    const f = await waiting(draft);
+    try { await f.refuse(1n); expect(f.player.state).toBe('error'); expect(f.catalogs()).toHaveLength(1); }
+    finally { await f.close(); }
+  });
+
+  it('does not extend the original wait bound after a second refusal', async () => {
+    const f = await waiting(draft);
+    try {
+      await f.refuse(); await f.advance(19_000); await f.announce(); expect(f.catalogs()).toHaveLength(2);
+      await f.refuse(); await f.advance(1000); expect(f.player.state).toBe('error');
+      expect(f.catalogs()).toHaveLength(2);
+    } finally { await f.close(); }
+  });
+
+  it.each(['announcement', 'timer'] as const)('keeps the positive Retry Interval race single-shot when %s wins', async winner => {
+    const f = await waiting(draft);
+    try {
+      await f.refuse(0x10n, 5001n);
+      await f.advance(winner === 'timer' ? 5000 : 1000);
+      await f.announce(); expect(f.catalogs()).toHaveLength(winner === 'timer' ? 2 : 1);
+      if (winner === 'announcement') { await f.advance(3999); expect(f.catalogs()).toHaveLength(1); await f.advance(1); }
+      await f.advance(5001); expect(f.catalogs()).toHaveLength(2); expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it('does not re-subscribe on an announcement from a draining session', async () => {
+    const f = await waiting(draft);
+    try {
+      await f.refuse(); expect(f.errors).toEqual([]);
+      await f.server.sendGoaway({ newSessionUri: '', requestId: 100n, timeout: 0n }); await flush(128);
+      await f.announce(); await f.advance(1000); expect(f.catalogs()).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+});
+
+
+it('bounds the catalog wait even while the namespace send promise is held', async () => {
+  const f = await waiting(18, 'accepted', true);
+  try {
+    await f.refuse(); await f.advance(19_999); expect(f.errors).toEqual([]);
+    await f.advance(1); expect(f.player.state).toBe('error'); expect(f.catalogs()).toHaveLength(1);
+  } finally { await f.close(); }
+});
+
+
+describe.each([18, 22] as const)('repair catalog wait draft %i', draft => {
+  it('keeps the positive retry after the announcement bound and receives the catalog', async () => {
+    const f = await waiting(draft);
+    const received: unknown[] = [];
+    f.player.on('catalog_received', event => received.push(event));
+    try {
+      await f.refuse(0x10n, 30_001n); await f.advance(20_000);
+      expect(f.errors).toEqual([]); expect(f.catalogs()).toHaveLength(1);
+      await f.advance(9999); expect(f.catalogs()).toHaveLength(1);
+      await f.advance(1); expect(f.catalogs()).toHaveLength(2);
+      await f.server.acceptSubscribe(f.catalogs()[1]!.id, 50n); await flush(128);
+      const stream = await f.server.openSubgroup(50n, 0n, 0n);
+      await f.server.sendObject(stream, 0n, new TextEncoder().encode(JSON.stringify({ version: 1, tracks: [
+        { name: 'video', role: 'video', packaging: 'loc', isLive: true, codec: 'avc1.640028', width: 10, height: 10, renderGroup: 1 },
+      ] }))); await flush(128);
+      expect(received).toHaveLength(1); expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  });
+  it('allows the watch acceptance to follow the catalog refusal', async () => {
+    const f = await waiting(draft, 'pending');
+    try {
+      await f.refuse(); expect(f.errors).toEqual([]);
+      await f.server.acceptSubscribeNamespace(f.watches[0]!); await f.announce();
+      expect(f.catalogs()).toHaveLength(2); expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  });
+  it('retires the refusal bound when the replacement catalog subscription is accepted', async () => {
+    const f = await waiting(draft);
+    try {
+      await f.refuse(); await f.advance(19_000); await f.announce();
+      await f.server.acceptSubscribe(f.catalogs()[1]!.id, 50n); await flush(128);
+      await f.advance(1500); expect(f.errors).toEqual([]); expect(f.player.state).not.toBe('error');
+    } finally { await f.close(); }
+  });
+  it('keeps catalog_received pending on the watchdog during the publisher wait', async () => {
+    const f = await waiting(draft);
+    const watchdog = (f.player as unknown as { watchdog: { fulfill(event: string): void } }).watchdog;
+    const fulfill = vi.spyOn(watchdog, 'fulfill');
+    try { await f.refuse(); expect(fulfill).not.toHaveBeenCalledWith('catalog_received'); }
+    finally { await f.close(); }
+  });
+});
+
+describe.each([[0x10n, 'MALFORMED_AUTH_TOKEN'], [0x4n, 'TRACK_DOES_NOT_EXIST']] as const)('draft-14 catalog refusal %s (%s)', (code, label) => {
+  it(code === 0x4n ? 'waits for an announcement on TRACK_DOES_NOT_EXIST' : 'fails immediately on MALFORMED_AUTH_TOKEN', async () => {
+    const { a, b } = createLoopback();
+    const client = new MoqtConnection(14), server = new MoqtConnection(14, { role: 'server' });
+    const requests: Array<{ id: bigint; name: string }> = [], watches: bigint[] = [], errors: string[] = [];
+    server.onSubscribe = (id, _ns, name) => { requests.push({ id, name: new TextDecoder().decode(name) }); };
+    const handle = server.session.handleControlMessage.bind(server.session);
+    vi.spyOn(server.session, 'handleControlMessage').mockImplementation(msg => {
+      if (msg.type === 'SUBSCRIBE_NAMESPACE') {
+        watches.push(msg.requestId);
+        (server.session as unknown as { validateAndReplenish(id: bigint): unknown }).validateAndReplenish(msg.requestId);
+        return [];
+      }
+      return handle(msg);
+    });
+    const player = new MoqtPlayer({ url: 'https://relay.invalid/moq', namespace: 'live', draftVersion: 14,
+      publisherWaitMs: 20_000, catalogBootstrap: 'subscribe', disableAudio: true, autoQuality: false,
+      createConnection: () => client,
+      createTransport: async () => { void server.connect(b, { maxRequestId: varint(1_000_000) }).catch(() => {}); return a; } });
+    player.on('error', e => { if (e.error.severity === 'fatal') errors.push(e.error.message); });
+    try {
+      await player.load(); await flush(128);
+      if (watches.length) { a.bidiOut[0]!.in.injectRead(Uint8Array.of(0x12, 0, 1, Number(watches[0]!))); await flush(128); }
+      const cat = requests.find(r => r.name === 'catalog')!;
+      await server.rejectSubscribe(cat.id, code, label); await flush(128);
+      const immediate = player.state;
+      await vi.advanceTimersByTimeAsync(5000); await flush(128);
+      expect(immediate).toBe(code === 0x4n ? 'loading' : 'error');
+    } finally { await player.destroy(); await client.close(); await server.close(); }
+  });
+});
+
+
+it('allows an announcement once a short positive minimum has elapsed, before base backoff', async () => {
+  const f = await waiting(18);
+  try {
+    await f.refuse(0x10n, 1n); await f.advance(500); expect(f.catalogs()).toHaveLength(1);
+    await f.announce(); expect(f.catalogs()).toHaveLength(2);
+    await f.advance(1000); expect(f.catalogs()).toHaveLength(2);
+  } finally { await f.close(); }
+});
+
+
+it('repair d16 requests NAMESPACE with Subscribe Options 0x01 on the wire', async () => {
+  const f = await announcedPlayer(16);
+  try { expect(f.namespaceOptions).toBe(1n); }
+  finally { await f.close(); }
+});
+
+describe.each([18, 22] as const)('repair announced media failure draft %i', draft => {
+  it.each([0x10n, 1n])('ends a refused replacement in MEDIA_STARVED within its bound (code=%s)', async code => {
+    const f = await announcedPlayer(draft), fatal: number[] = [];
+    f.player.on('error', event => { if (event.error.severity === 'fatal') fatal.push(event.error.code); });
+    try {
+      await f.announce(true); await f.announce(); expect(f.requests).toHaveLength(2);
+      await f.server.rejectSubscribe(f.requests[1]!, code, 'not ready'); await flush(128);
+      if (code === 0x10n) {
+        expect(fatal).toEqual([]); await f.advance(19_999); expect(fatal).toEqual([]);
+        await f.advance(1);
+      }
+      expect(fatal).toEqual([0x1005]); expect(f.player.state).toBe('error');
+      expect(f.requests).toHaveLength(2);
+    } finally { await f.close(); }
+  });
+  it('reports MEDIA_STARVED when the announced replacement fails to send', async () => {
+    const f = await announcedPlayer(draft), fatal: number[] = [];
+    f.player.on('error', event => { if (event.error.severity === 'fatal') fatal.push(event.error.code); });
+    try {
+      vi.spyOn(f.client, 'subscribe').mockRejectedValueOnce(new Error('send failed'));
+      await f.announce(true); await f.announce(); await flush(256);
+      expect(fatal).toEqual([0x1005]); expect(f.player.state).toBe('error');
+    } finally { await f.close(); }
+  });
+});
+
+it('repair healthy arrivals avoid the withdrawal subscription scan and JSON encoding', async () => {
+  const f = await announcedPlayer(18);
+  const owner = f.player as unknown as { activeSubscriptions: Map<bigint, unknown>; stampMediaArrival(alias: bigint): void };
+  const scan = vi.spyOn(owner.activeSubscriptions, 'values'), json = vi.spyOn(JSON, 'stringify');
+  try {
+    owner.stampMediaArrival(50n);
+    expect(scan).not.toHaveBeenCalled(); expect(json).not.toHaveBeenCalled();
+  } finally { scan.mockRestore(); json.mockRestore(); await f.close(); }
+});
+
+it('repair d14 refuses forwarded unsolicited PUBLISH with UNINTERESTED', async () => {
+  const f = await announcedPlayer(14), responses: ControlMessage[] = [];
+  f.server.onMessage = message => responses.push(message);
+  try {
+    const id = await f.server.publish([new TextEncoder().encode('live')], new TextEncoder().encode('unsolicited'), 90n);
+    await flush(256);
+    expect(responses).toContainEqual(expect.objectContaining({ type: 'REQUEST_ERROR', requestId: id, errorCode: 4n }));
+    await f.player.destroy(); expect(f.client.onPublish).toBeUndefined();
+  } finally { await f.close(); }
+});
+
+
+describe.each([18, 22] as const)('retry clocks, draft %i', draft => {
+  it.each([
+    [1n, 2_496, 22_996], [5_001n, 5_250, 21_996], [15_001n, 15_250, 25_000], [30_001n, 30_250, 40_000],
+  ] as const)('honours interval %s without shortening recovery', async (interval, earliestFatalMs, fatalAfterMs) => {
+    const f = await playing(draft, { config: { livenessTimeoutMs: 10_000,
+      livenessRestartBackoffMs: 1_000, livenessMaxRestarts: 3, livenessResetProbeMs: 2_000 } });
+    try {
+      await f.run(10_000);
+      const rep = await f.replacementSeen(30_000), refusedAt = f.now();
+      const refused = new Set([rep.id]);
+      let lastRefusalAt = refusedAt;
+      await f.refuse(rep.id, interval);
+      for (let elapsed = 0; elapsed < 100_000 && f.player.state !== 'error'; elapsed += 100) {
+        await f.run(100);
+        for (const request of f.identitySubscribesAfter(rep.id)) {
+          if (refused.has(request.id)) continue;
+          expect(request.t - lastRefusalAt).toBeGreaterThanOrEqual(Number(interval - 1n));
+          refused.add(request.id);
+          lastRefusalAt = f.now();
+          await f.refuse(request.id, interval);
+        }
+      }
+      const fatal = f.events.find(e => e.kind === 'player:error' && e.detail?.includes('fatal'));
+      expect(fatal).toBeDefined();
+      // The established ladder's fatal times with these same refusal inputs.
+      expect(fatal!.t - refusedAt).toBeGreaterThanOrEqual(earliestFatalMs);
+      expect(f.identitySubscribesAfter(rep.id).length).toBeGreaterThan(0);
+      // The first silent refresh has already used one of the three windows.
+      expect(fatal!.t - refusedAt).toBe(fatalAfterMs);
+      if (interval === 1n) expect(fatal!.t - refusedAt).toBeLessThan(30_000);
+    } finally { await f.close(); }
+  });
+
+  it('honours a refusal received during backoff before starting another attempt', async () => {
+    const f = await playing(draft, { config: { livenessRestartBackoffMs: 100 } });
+    try {
+      const rep = await f.replacementSeen();
+      await f.run(60); // The arrival probe has ended; the next backoff is running.
+      const refusedAt = f.now();
+      await f.refuse(rep.id, 60_001n);
+      await f.run(59_995);
+      expect(f.player.state).toBe('playing');
+      expect(f.identitySubscribesAfter(rep.id)).toEqual([]);
+      await f.run(255);
+      const next = f.identitySubscribesAfter(rep.id)[0];
+      expect(next).toBeDefined();
+      expect(next!.t - refusedAt).toBeGreaterThanOrEqual(60_000);
+      expect(next!.t - refusedAt).toBeLessThanOrEqual(60_250);
+      expect(f.recovery.at(-1)!.attempt).toBe(3);
+    } finally { await f.close(); }
+  });
+
+  it('preserves refusal backoff across attempt boundaries', async () => {
+    const f = await playing(draft, { config: { livenessTimeoutMs: 100,
+      livenessRestartBackoffMs: 20, livenessMaxRestarts: 5 } });
+    const refused = new Set<bigint>(), trace: { sent: number; refused: number }[] = [];
+    try {
+      const rep = await f.replacementSeen();
+      for (let elapsed = 0; elapsed < 3_500 && f.player.state !== 'error'; elapsed += 5) {
+        for (const request of f.requests.filter(r => r.name === 'video' && r.id >= rep.id)) {
+          if (refused.has(request.id)) continue;
+          refused.add(request.id);
+          trace.push({ sent: request.t, refused: f.now() });
+          await f.refuse(request.id, 1n);
+        }
+        await f.run(5);
+      }
+      expect(trace.length).toBeGreaterThan(3);
+      for (let i = 1; i < trace.length; i++) {
+        expect(trace[i]!.sent - trace[i - 1]!.refused).toBeGreaterThanOrEqual(Math.min(20 * 2 ** (i - 1), 5_000));
+      }
+    } finally { await f.close(); }
+  });
+});
+
+
+it.each([18, 22] as const)('bounds a blocked replacement stream on draft %s', async draft => {
+  const f = await playing(draft);
+  const open = f.a.createBidirectionalStream.bind(f.a);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const blocked = vi.spyOn(f.a, 'createBidirectionalStream').mockImplementation(async () => {
+    await gate;
+    return open();
+  });
+  try {
+    await f.run(6_000);
+    expect(blocked).toHaveBeenCalled();
+    expect(f.player.state).toBe('error');
+    expect(f.errors).toContainEqual(expect.objectContaining({ code: PlayerErrorCode.MEDIA_STARVED, severity: 'fatal' }));
+    const fatal = f.events.find(e => e.kind === 'player:error' && e.detail?.includes('fatal'));
+    expect(fatal!.t).toBeGreaterThanOrEqual(389);
+    expect(fatal!.t).toBeLessThanOrEqual(639);
+  } finally { blocked.mockRestore(); release(); await flush(128); await f.close(); }
 });

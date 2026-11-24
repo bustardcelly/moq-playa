@@ -85,7 +85,7 @@ export class Player {
   // ─── Static ──────────────────────────────────────────────────────
 
   /** Player version (set at build time). */
-  static readonly version = '0.6.1';
+  static readonly version = '0.7.0';
 
   /** Check if the current browser supports MoQ playback. */
   static isSupported(): boolean {
@@ -358,6 +358,7 @@ export class Player {
       latencyMs: s.currentLatencyMs,
       captureTimestampAgeMs: s.captureTimestampAgeMs ?? null,
       videoPlaybackQuality: s.videoPlaybackQuality ?? null,
+      videoPresentationObservation: s.videoPresentationObservation ?? null,
       stallCount: s.stallCount,
       timeToFirstFrameMs: s.timeToFirstFrameMs,
       resolution: s.currentResolution ?? null,

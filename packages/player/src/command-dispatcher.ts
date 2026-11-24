@@ -812,12 +812,6 @@ export class CommandDispatcher {
         }
         break;
 
-      case 'set_playback_rate':
-        // Route to audio output — video catch-up uses frame dropping, not rate.
-        // Optional chaining: AudioOutputLike.setPlaybackRate is optional.
-        // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
-        this.audioOutput?.setPlaybackRate?.(cmd.rate);
-        break;
     }
   }
 
@@ -937,8 +931,8 @@ export class CommandDispatcher {
   /**
    * Flush all pending output — stop scheduled audio and discard queued frames.
    *
-   * Reached only from pause and from a seek, both of which supersede playback
-   * rather than recover it, so any in-flight stall episode is abandoned. The
+   * Pause, seek and live latency jumps supersede queued output, so any
+   * in-flight stall episode is abandoned. The
    * `reset` command path deliberately does not do this: that flush is owned by
    * stall recovery, and its episode must survive to be completed by the next
    * rendered frame.

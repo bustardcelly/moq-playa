@@ -192,6 +192,11 @@ export interface VideoRendererLike {
   /** Enqueue a decoded frame for presentation at the specified time. */
   enqueue(frame: unknown, renderTimeUs: number, token?: object, outputTiming?: VideoProducedTiming): void;
 
+  /** Set the shared LOC output rate. Retimes queued frames about the current
+   * clock instant and schedules future frames at this rate. 1 restores normal
+   * timing. Optional: without this hook LOC catch-up is disabled. */
+  setPlaybackRate?(rate: number): void;
+
   /** Optional single presentation tick while the embedding's automatic loop is stopped. */
   renderTick?(nowUs: number): void;
 
@@ -276,7 +281,8 @@ export interface AudioOutputLike {
 
   /**
    * Set playback rate for live catch-up. Optional — if not implemented,
-   * catch-up degrades to video-only (frame dropping).
+   * catch-up is unavailable for outputs containing audio.
+   * Retimes already-scheduled audio as well as future audio to keep shared output aligned.
    * Rate 1.0 = normal, >1.0 = faster (catching up).
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
@@ -492,8 +498,10 @@ export interface MediaSourceLike {
    * group. The caller releases it after FIN/reset AND accepted routing work
    * settles. `isCurrent` captures the registration and source owner; it must
    * not resolve a reused alias. An adapter may bound or decline this evidence.
-   * No payload ownership, completion, or presentation is implied. This only
-   * extends an already-known positive DTS gap, with a bounded deadline.
+   * No payload ownership, completion, or presentation is implied. Video
+   * evidence only extends an already-known positive DTS gap, with a bounded
+   * deadline; audio evidence only affects escalation-time hole recovery
+   * (tryRecoverBufferedGap), never ordinary append timing.
    * When supplied, sourceKey is the same opaque identity used for appendChunk
    * and clearTimeline; trackName remains the human-readable label.
    */
@@ -576,6 +584,20 @@ export interface MediaSourceLike {
    */
   reserveSwitchRecovery?(target: { mediaType: 'video'; trackName: string; sourceKey?: string }): MediaSwitchRecovery | null;
 
+  /**
+   * Called synchronously and re-entrantly from inside onError at hole escalation,
+   * only for ordinary live playback without a switch, seek, finite target or
+   * explicit subscription filter owner. Accept the exact current hole error once;
+   * reject stale and failed-landing errors. Receiving evidence means current audio
+   * or video streams at or below their track's committed group floor when this
+   * hole was first observed (unknown floors remain conservative); newer groups
+   * cannot fill it. A reset is not loss evidence. Recheck this evidence, pending
+   * work, playback ownership and native landing coverage for each existing track.
+   * True means the adapter has already seeked once and armed its landing watchdog.
+   * False, an absent method, or a thrown exception keeps fatal escalation.
+   */
+  tryRecoverBufferedGap?(error: Error): boolean;
+
   /** Per-source replay state; display names remain unchanged when an opaque key is supplied. */
   getCommittedGroupFloor?(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): bigint | undefined;
   clearTimeline?(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): void;
@@ -606,6 +628,16 @@ export interface MediaSourceLike {
    * currentTime now outside all buffered ranges).
    */
   getBufferAheadUs?(): number | null;
+
+  /** Set the shared media-element A/V rate, preserving pitch. Optional: outputs
+   * require this capability and getBufferAheadUs to catch up. Called only when
+   * maxCatchUpRate > 1; the player restores 1 on retirement. */
+  setPlaybackRate?(rate: number): void;
+
+  /** Live startup cushion in microseconds, added to an appended Object's duration.
+   * null preserves immediate finite startup. Adapters omitting this hook retain
+   * their existing startup behavior. This is the player's shared buffer target. */
+  setLiveStartupCushion?(cushionUs: number | null): void;
 
   /** Native element-load-scoped video counters, or null without owned video,
    * support, or valid measurements. A supported all-zero snapshot is observed

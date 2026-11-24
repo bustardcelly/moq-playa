@@ -18,7 +18,7 @@ export type {
   ObjectReceptionPropertiesOmission,
   ObjectReceptionOptions,
 } from './object-reception.js';
-export type { TrackSubscription, TrackSubscribeOptions, IncomingPublish, ConnectOptions } from './adapter.js';
+export type { TrackSubscription, TrackSubscribeOptions, IncomingPublish, ConnectOptions, MalformedPublicationTerminationResult, MalformedSourceCancellationResult } from './adapter.js';
 export { catToken, AuthorizationError } from './authorization.js';
 export type { AuthorizationToken, AuthorizationContext, AuthorizationOperation, AuthorizationProvider, ConnectionAuthorization } from './authorization.js';
 export type { DataStreamTerminal, GoawayNotice } from './adapter.js';
@@ -47,3 +47,5 @@ export { createUniPairTopology, UniPairTopology } from './topology/uni-pair.js';
 export type { RequestStream } from './topology/uni-pair.js';
 
 export type { FetchReceiver, FetchReceiveContext } from './fetch-receiver.js';
+
+export { RequestUpdateFailure, RequestUpdateError } from './request-update-confirmation.js';

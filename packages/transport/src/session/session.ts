@@ -13,7 +13,7 @@
  */
 
 import { varint, type Varint } from '../primitives/varint.js';
-import { readLocation } from '../primitives/location.js';
+import { readLocation, writeLocation, locationEncodingLength } from '../primitives/location.js';
 
 /** vi64 ceiling (2^64 − 1) — the widest Location component any draft can
  *  encode; resume-provider results above it are unencodable, so they fail
@@ -21,6 +21,7 @@ import { readLocation } from '../primitives/location.js';
 const MAX_VI64 = 18446744073709551615n;
 import {
   encodeFillParameters, encodeSubscriptionFilter, validateSubscriptionFilter, decodeSubscriptionFilter, subscriptionWindow, type SubscriptionFilter,
+  isRelativeLocationFilter,
 } from '../control/subscription-filter.js';
 import { resolveJoiningFetchRange } from './joining.js';
 import { decodeFillParameters, resolveFillWindow, type FillOptions } from '../control/fill-parameters.js';
@@ -92,7 +93,7 @@ import { MessageParam } from '../control/parameters.js';
 import type { Parameters, ParameterValue, TrackProperties } from '../control/messages.js';
 import { AuthTokenCache, AuthCacheError } from './auth-cache.js';
 import { AliasType, parseAuthorizationToken, parseAuthorizationToken18, type AuthorizationToken, type ResolvedToken } from '../control/auth-token.js';
-import { isDraft22, isRequestStreamDraft } from '../versions.js';
+import { DEFAULT_DRAFT_VERSION, isDraft22, isDraft23, isRequestStreamDraft } from '../versions.js';
 
 /**
  * Set of known message parameter type codes.
@@ -263,6 +264,78 @@ const VALID_PARAMS_FOR_MESSAGE_TYPE_22: Map<bigint, Set<string>> = new Map([
   [MessageParam.TRACK_NAMESPACE_PREFIX as bigint, new Set(['REQUEST_UPDATE'])],
   [0x35n, new Set(['SUBSCRIBE', 'FETCH', 'TRACK_STATUS', 'SUBSCRIBE_TRACKS'])],
 ]);
+
+// ─── draft-23 message parameters (draft-23 §9.19, Table 7) ───────────
+
+/** draft-23 SUBSCRIBE_TRACKS_ID (§9.19.21): a PUBLISH's originating SUBSCRIBE_TRACKS. */
+const SUBSCRIBE_TRACKS_ID = 0x36n;
+
+/**
+ * Every draft-23 message parameter. FORWARD (0x10) stands for PAUSED (0x11):
+ * the codec rewrites it, so the session keeps the draft-22 semantic parameter.
+ */
+const KNOWN_MESSAGE_PARAMS_23 = new Set<bigint>([...KNOWN_MESSAGE_PARAMS_22, SUBSCRIBE_TRACKS_ID]);
+
+/**
+ * draft-23 message-parameter scope table (§9.19). Draft 22's, except that
+ * EXPIRES may appear in any REQUEST_OK and in FETCH_OK, LARGEST_OBJECT in
+ * FETCH_OK, FILL_PARAMETERS in PUBLISH, SUBSCRIBE_TRACKS_ID in PUBLISH, and
+ * RENDEZVOUS_TIMEOUT and NEW_GROUP_REQUEST no longer in SUBSCRIBE_TRACKS
+ * (§3.6.2). NAMESPACE has no parameters.
+ */
+const VALID_PARAMS_FOR_MESSAGE_TYPE_23: Map<bigint, Set<string>> = new Map([
+  ...VALID_PARAMS_FOR_MESSAGE_TYPE_22,
+  [MessageParam.RENDEZVOUS_TIMEOUT as bigint, new Set(['SUBSCRIBE'])],
+  [MessageParam.EXPIRES as bigint, new Set(['SUBSCRIBE_OK', 'PUBLISH', 'PUBLISH_OK', 'REQUEST_UPDATE_OK', 'TRACK_STATUS_OK',
+    'SUBSCRIBE_NAMESPACE_OK', 'SUBSCRIBE_TRACKS_OK', 'PUBLISH_NAMESPACE_OK', 'FETCH_OK'])],
+  [MessageParam.LARGEST_OBJECT as bigint, new Set([
+    'SUBSCRIBE_OK', 'PUBLISH', 'REQUEST_UPDATE_OK', 'TRACK_STATUS_OK', 'PUBLISH_STATE_NOTIFY', 'FETCH_OK',
+  ])],
+  [FILL_PARAMETERS, new Set(['SUBSCRIBE', 'REQUEST_UPDATE', 'SUBSCRIBE_TRACKS', 'PUBLISH'])],
+  [MessageParam.NEW_GROUP_REQUEST as bigint, new Set(['SUBSCRIBE', 'REQUEST_UPDATE'])],
+  [SUBSCRIBE_TRACKS_ID, new Set(['PUBLISH'])],
+]);
+
+function isLocationValue(v: unknown): v is { group: bigint; object: bigint } {
+  return typeof v === 'object' && v !== null && !(v instanceof Uint8Array) && !Array.isArray(v)
+    && 'group' in v && 'object' in v;
+}
+
+/**
+ * The last Location a FETCH requested, inclusive. A FETCH's End Object is
+ * carried as End Object + 1, and 0 selects the whole End Group. `undefined`
+ * when the request has no range (a Joining FETCH).
+ */
+function locationBefore(a: { group: bigint; object: bigint }, b: { group: bigint; object: bigint }): boolean {
+  return a.group < b.group || (a.group === b.group && a.object < b.object);
+}
+
+/**
+ * draft-23 §3.2 / §9.3: the parameters of the REQUEST_OK that answers a FETCH.
+ * When Largest Object falls inside the requested range the response ends there
+ * and LARGEST_OBJECT MUST be present, so `options.largestObject` is sent when it
+ * lies within the range. `endLocation` is not used: callers disagree on whether
+ * it is inclusive. Parameters the caller sets explicitly are kept.
+ */
+function fetchOkParameters23(fetch: FetchStateMachine, options: FetchAcceptOptions): Parameters {
+  const parameters: Parameters = new Map(options.parameters ?? []);
+  const explicit = parameters.get(MessageParam.LARGEST_OBJECT as bigint);
+  const largest = explicit === undefined ? options.largestObject : explicit[0];
+  if (largest === undefined && explicit === undefined) return parameters;
+  if (!isLocationValue(largest)) throw new SessionError('LARGEST_OBJECT must be a Location', 'INVALID_STATE');
+  const start = fetch.startGroup === undefined ? undefined : { group: fetch.startGroup, object: fetch.startObject ?? 0n };
+  if (start !== undefined && locationBefore(largest, start)) {
+    // §3.2: a Start Location past Largest Object is INVALID_RANGE, not an OK.
+    throw new SessionError(`Largest Object ${largest.group}/${largest.object} is before the FETCH start`, 'INVALID_STATE');
+  }
+  // Explicit parameters take precedence, but cannot bypass the range validation.
+  if (explicit !== undefined) return parameters;
+  const requestedEnd = requestedFetchEnd(fetch);
+  if (requestedEnd === undefined || !locationBefore(requestedEnd, largest)) {
+    parameters.set(MessageParam.LARGEST_OBJECT as bigint, [{ group: largest.group, object: largest.object }]);
+  }
+  return parameters;
+}
 
 /**
  * Whether two Track Namespace Prefixes overlap: one is a (field-wise) prefix of
@@ -456,6 +529,8 @@ export interface FetchOptions extends AuthorizationOptions {
  * with (and never overlapping) the subscription's delivery.
  */
 export interface JoiningFetchOptions extends AuthorizationOptions {
+  /** d14 §9.16 / d16 §9.2.2.3 / d18 §10.2.7: 0-255, lower is higher priority. Omitted defaults to 128. */
+  subscriberPriority?: Varint;
   /** 'relative' = Fetch Type 0x2, 'absolute' = 0x3. */
   joiningFetchType: 'relative' | 'absolute';
   /** Request ID of OUR outbound SUBSCRIBE to join (NOT a track alias). */
@@ -476,10 +551,21 @@ export interface JoiningFetchOptions extends AuthorizationOptions {
  * are vi64 (full uint64) on draft-18, so `bigint`.
  */
 export interface FetchAcceptOptions {
-  /** 1 if the End Location is the final Object in the Track, else 0. */
+  /**
+   * 1 if the End Location is the final Object in the Track, else 0. Draft 23
+   * has no such field: send an End of Track marker on the data stream instead
+   * (`sendFetchEndMarker`, §11.4.2.2).
+   */
   endOfTrack?: number;
-  /** End of the range covered by the FETCH response. */
+  /** End of the range covered by the FETCH response. Draft 23 has no such field. */
   endLocation?: { group: bigint; object: bigint };
+  /**
+   * draft-23 §3.2: the track's Largest Object, inclusive. Sent as LARGEST_OBJECT
+   * when it falls inside the requested range, where the response then ends;
+   * draft 23 requires it there. Must not precede the FETCH start. Ignored before
+   * draft 23.
+   */
+  largestObject?: { group: bigint; object: bigint };
   /** Response parameters. */
   parameters?: Parameters;
   /** draft-18 Track Properties (§2.5) on the FETCH_OK; non-empty on draft-14/16 throws. */
@@ -664,6 +750,7 @@ export class Session {
     objectDeliveryTimeoutMs?: number;
     subgroupDeliveryTimeoutMs?: number;
     subscriptionFilter?: Uint8Array;
+    subscriberPriority?: Varint;
   }>();
 
   /**
@@ -763,7 +850,7 @@ export class Session {
 
   constructor(
     private readonly _role: EndpointRoleValue,
-    private readonly _draftVersion: DraftVersion = 16,
+    private readonly _draftVersion: DraftVersion = DEFAULT_DRAFT_VERSION,
     /**
      * Session-level policy. `webtransport: true` enables the §10.3.1.1/§10.3.1.2
      * rule that PATH/AUTHORITY MUST NOT appear in SETUP over WebTransport (the WT
@@ -1394,19 +1481,19 @@ export class Session {
    * A GOAWAY arriving on a request stream is handled separately by the topology.
    */
   private handleGoaway(msg: Goaway): SessionOutboundAction[] {
-    // §9.4 / §10.4: at most one GOAWAY on the control stream.
+    // Draft 23 §9.2 assigns UNEXPECTED_MESSAGE to duplicate GOAWAY.
     if (this._goawayReceived) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        isDraft23(this._draftVersion) ? SessionErrorCode.UNEXPECTED_MESSAGE : SessionErrorCode.PROTOCOL_VIOLATION,
         'Received multiple GOAWAY messages on the control stream',
       );
     }
 
-    // §9.4 / §10.4: a server MUST close if it receives a non-empty New Session URI
+    // Draft 23 §9.2 assigns ROLE_VIOLATION to a server receiving a non-empty URI
     // (clients cannot instruct servers to initiate connections).
     if (this._role === EndpointRole.SERVER && msg.newSessionUri.length > 0) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        isDraft23(this._draftVersion) ? SessionErrorCode.ROLE_VIOLATION : SessionErrorCode.PROTOCOL_VIOLATION,
         'Server received GOAWAY with non-empty New Session URI',
       );
     }
@@ -1546,6 +1633,8 @@ export class Session {
     if (propertyFault) return this.rejectMalformedTrackResponse(msg.requestId as bigint, propertyFault);
 
     sub.handleSubscribeOk(msg.trackAlias);
+    const head = this.extractLargestObjectParam(msg.parameters);
+    if (head) sub.updateLargestLocation(head.group, head.object);
     this.settleFillRequest(msg.requestId as bigint, msg.parameters);
     if (isDraft22(this._draftVersion)) {
       const properties = msg.trackProperties ?? msg.trackExtensions;
@@ -1553,7 +1642,7 @@ export class Session {
     }
     sub.locationWindow = subscriptionWindow(
       sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, this._draftVersion),
-      this.extractLargestObjectParam(msg.parameters) ?? undefined,
+      this.extractLargestObjectParam(msg.parameters) ?? undefined, this._draftVersion,
     );
 
     // Register track alias - §9.10/§10.1: duplicate alias must close connection
@@ -1587,6 +1676,12 @@ export class Session {
       this.pendingUpdates.delete(msg.requestId as bigint);
       // Don't apply the update — it was rejected, and it opens no fill.
       this.fillRequests.delete(msg.requestId as bigint);
+      const fetch = this.fetches.get(pending.existingRequestId);
+      if (fetch && !fetch.isCompleted) {
+        fetch.sendFetchCancel();
+        this.fetches.delete(pending.existingRequestId);
+        return [{ type: 'cancel_request', requestId: pending.existingRequestId, reason: 'FETCH update refused', fetchDataError: true }];
+      }
       return [];
     }
 
@@ -1682,13 +1777,15 @@ export class Session {
     // §10.6.2: a server never receives a relocation to another session.
     if (this._role === EndpointRole.SERVER && redirect.connectUri.length > 0) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        isDraft23(this._draftVersion) ? SessionErrorCode.ROLE_VIOLATION : SessionErrorCode.PROTOCOL_VIOLATION,
         'REQUEST_ERROR Redirect with a non-empty Connect URI received by a server endpoint (§10.6.2)',
       );
     }
 
+    // Draft 23 §9.4.2.1 includes SUBSCRIBE_TRACKS among namespace-scoped redirects.
+    const isTracks = isDraft23(this._draftVersion) && this.trackSubscriptions.has(rid);
     // Request types for which REDIRECT is explicitly NOT allowed.
-    if (this.pendingUpdates.has(rid) || this.trackSubscriptions.has(rid) || this.outgoingPublishes.has(rid)) {
+    if (this.pendingUpdates.has(rid) || (this.trackSubscriptions.has(rid) && !isTracks) || this.outgoingPublishes.has(rid)) {
       return this.closeWithError(
         SessionErrorCode.PROTOCOL_VIOLATION,
         `REQUEST_ERROR Redirect is not valid for this request type (request ${rid})`,
@@ -1698,16 +1795,16 @@ export class Session {
     const isPubNs = this.publishedNamespaces.has(rid);
     const isSubNs = this.namespaceSubscriptions.has(rid);
     const allowed = this.subscriptions.has(rid) || this.fetches.has(rid)
-      || this.pendingTrackStatuses.has(rid) || isPubNs || isSubNs;
+      || this.pendingTrackStatuses.has(rid) || isPubNs || isSubNs || isTracks;
     if (!allowed) {
       // Unknown request ID — let the normal dispatch close with INVALID_REQUEST_ID.
       return null;
     }
 
     // §10.6.2: a namespace-scoped request must not carry a replacement Track Name.
-    if ((isPubNs || isSubNs) && redirect.trackName.length > 0) {
+    if ((isPubNs || isSubNs || isTracks) && redirect.trackName.length > 0) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        isDraft23(this._draftVersion) ? SessionErrorCode.INVALID_FIELD : SessionErrorCode.PROTOCOL_VIOLATION,
         'REQUEST_ERROR Redirect for a namespace-scoped request must have an empty Track Name (§10.6.2)',
       );
     }
@@ -1759,7 +1856,8 @@ export class Session {
     // §5.2: a duplicate FETCH_OK for a live fetch is a violation → close.
     if (fetch.responseReceived) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        // draft-23 §12.2: a duplicate OK is UNEXPECTED_MESSAGE.
+        isDraft23(this._draftVersion) ? SessionErrorCode.UNEXPECTED_MESSAGE : SessionErrorCode.PROTOCOL_VIOLATION,
         `Duplicate FETCH_OK for request ${msg.requestId}`,
       );
     }
@@ -1877,11 +1975,41 @@ export class Session {
 
   private receivedTrackPropertyFault(props: TrackProperties | undefined): string | null {
     return isRequestStreamDraft(this._draftVersion) && props !== undefined
-      ? supportedPropertyFault(props, 'track') : null;
+      ? supportedPropertyFault(props, 'track', this._draftVersion) : null;
   }
 
   private rejectMalformedTrackResponse(requestId: bigint, reason: string): SessionOutboundAction[] {
     return this.handleMalformedTrack(requestId).map(action => action.type === 'cancel_request' ? { ...action, reason } : action);
+  }
+
+  /**
+   * draft-23 §9.3: a FETCH is answered with REQUEST_OK. If `msg` answers one of
+   * our pending FETCHes, return it as the FETCH_OK the rest of the stack handles:
+   * the End Location is LARGEST_OBJECT when the publisher sent it (Largest Object
+   * fell inside the range, §3.2), else the requested End Location. End Of Track
+   * is not known until an End of Track marker arrives on the data stream.
+   * A REQUEST_OK for a FETCH we cancelled is still its FETCH_OK, so the crossed
+   * response is tolerated as on earlier drafts. Returns `undefined` for any
+   * other REQUEST_OK, and before draft 23. {@link handleControlMessage} applies
+   * this itself; the I/O layer calls it to surface the FETCH_OK.
+   */
+  fetchOkFromRequestOk(requestId: bigint, msg: RequestOk): FetchOk | undefined {
+    if (!isDraft23(this._draftVersion)) return undefined;
+    const fetch = this.fetches.get(requestId);
+    if (!fetch && this.recentlyCancelled.get(requestId)?.kind !== 'fetch') return undefined;
+    const largest = msg.parameters.get(MessageParam.LARGEST_OBJECT as bigint)?.[0];
+    const endLocation = isLocationValue(largest)
+      ? { group: largest.group, object: largest.object }
+      : (fetch && requestedFetchEnd(fetch)) ?? { group: 0n, object: 0n };
+    const trackProperties = msg.trackProperties ?? msg.trackExtensions;
+    return {
+      type: 'FETCH_OK',
+      requestId,
+      endOfTrack: 0,
+      endLocation,
+      parameters: msg.parameters,
+      ...(trackProperties ? { trackProperties } : {}),
+    };
   }
 
   /**
@@ -1902,6 +2030,9 @@ export class Session {
   }
 
   private handleRequestOk(msg: RequestOk): SessionOutboundAction[] {
+    // draft-23 §9.3: a REQUEST_OK answering a FETCH is its FETCH_OK.
+    const fetchOk = this.fetchOkFromRequestOk(msg.requestId as bigint, msg);
+    if (fetchOk) return this.handleFetchOk(fetchOk);
     // draft-18 Track Properties are CONTEXT-dependent on a REQUEST_OK: valid only
     // when it answers a TRACK_STATUS (TRACK_STATUS_OK). For every other REQUEST_OK
     // context (REQUEST_UPDATE / PUBLISH_NAMESPACE / SUBSCRIBE_NAMESPACE /
@@ -1909,7 +2040,7 @@ export class Session {
     // them blind, so we enforce the request-stream context here.
     if (((msg.trackProperties ?? msg.trackExtensions)?.size ?? 0) > 0 && !this.pendingTrackStatuses.has(msg.requestId as bigint)) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        isDraft23(this._draftVersion) ? SessionErrorCode.INVALID_FIELD : SessionErrorCode.PROTOCOL_VIOLATION,
         `Track Properties are not valid on this REQUEST_OK (request ${msg.requestId})`,
       );
     }
@@ -1930,6 +2061,15 @@ export class Session {
     const pending = this.pendingUpdates.get(msg.requestId as bigint);
     if (pending) {
       this.pendingUpdates.delete(msg.requestId as bigint);
+      const owner = this.subscriptions.get(pending.existingRequestId) ?? this.incomingSubscriptions.get(pending.existingRequestId);
+      const head = this.extractLargestObjectParam(msg.parameters);
+      if (head && owner && !owner.isTerminated) owner.updateLargestLocation(head.group, head.object);
+      if (pending.subscriberPriority !== undefined) {
+        const fetch = this.fetches.get(pending.existingRequestId);
+        if (fetch && !fetch.isCompleted) fetch.currentPriority = pending.subscriberPriority;
+        const sub = this.subscriptions.get(pending.existingRequestId) ?? this.incomingSubscriptions.get(pending.existingRequestId);
+        if (sub && !sub.isTerminated) sub.currentPriority = pending.subscriberPriority;
+      }
 
       // Apply the update to the subscription (outgoing or, for a draft-18
       // PUBLISH-initiated subscription, the incoming one).
@@ -1939,7 +2079,7 @@ export class Session {
           sub.currentFilter = pending.subscriptionFilter;
           sub.locationWindow = subscriptionWindow(
             decodeSubscriptionFilter(pending.subscriptionFilter, this._draftVersion),
-            this.extractLargestObjectParam(msg.parameters) ?? undefined,
+            this.extractLargestObjectParam(msg.parameters) ?? undefined, this._draftVersion,
           );
         }
       }
@@ -1982,7 +2122,7 @@ export class Session {
       // Track Namespace Prefix on the outbound namespace/tracks subscription.
       if (pending.namespacePrefix && pending.prefixTarget) {
         if (pending.prefixTarget === 'namespace') {
-          this.namespaceSubscriptions.get(pending.existingRequestId)?.updatePrefix(pending.namespacePrefix);
+          this.namespaceSubscriptions.get(pending.existingRequestId)?.updatePrefix(pending.namespacePrefix, this._draftVersion);
         } else {
           const ts = this.trackSubscriptions.get(pending.existingRequestId);
           if (ts) ts.trackNamespacePrefix = pending.namespacePrefix;
@@ -2049,6 +2189,7 @@ export class Session {
     // Draft 22 PUBLISH_OK carries only EXPIRES; subscription parameters remain
     // those sent in PUBLISH until an accepted REQUEST_UPDATE changes them.
     if (isDraft22(this._draftVersion)) return;
+    sub.currentPriority = parameters?.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0] as Varint ?? varint(128n);
     const fwd = parameters?.get(MessageParam.FORWARD)?.[0];
     // FORWARD omitted from an acceptance defaults to 1. Only omission from a
     // REQUEST_UPDATE preserves the existing state (§9.2.2.8 / d18 §10.2.12).
@@ -2105,6 +2246,9 @@ export class Session {
   }
 
   private handlePublishDone(msg: PublishDone): SessionOutboundAction[] {
+    if (this._draftVersion === 16 && this.incomingSubscriptions.get(msg.requestId)?.isPublishInitiated) {
+      return this.handleInboundPublishDone(msg.requestId);
+    }
     // §9.19: "The publisher does not send PUBLISH_DONE for this request"
     if (this.pendingTrackStatuses.has(msg.requestId as bigint)) {
       return this.closeWithError(
@@ -2239,6 +2383,7 @@ export class Session {
       return [this.sendControl(errorMsg), ...(validated.replenish ?? [])];
     }
 
+    sub.currentPriority = msg.parameters.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0] as Varint ?? varint(128n);
     // §9.2.2.5: store the subscriber's filter type — the Joining Fetch gate
     // (§9.16.2) needs it. An omitted parameter = unfiltered (NOT Largest
     // Object). Malformed filter bytes were already rejected by the message
@@ -2264,6 +2409,10 @@ export class Session {
     if (order !== undefined) sub.requestedGroupOrder = order === 2n ? 'descending' : 'ascending';
 
     this.incomingSubscriptions.set(msg.requestId as bigint, sub);
+    if (sub.isPublishInitiated) {
+      const head = this.extractLargestObjectParam(msg.parameters);
+      if (head) sub.updateLargestLocation(head.group, head.object);
+    }
 
     return validated.replenish ?? [];
   }
@@ -2350,6 +2499,10 @@ export class Session {
     }
 
     this.incomingSubscriptions.set(msg.requestId as bigint, sub);
+    if (sub.isPublishInitiated) {
+      const head = this.extractLargestObjectParam(msg.parameters);
+      if (head) sub.updateLargestLocation(head.group, head.object);
+    }
 
     return validated.replenish ?? [];
   }
@@ -2407,6 +2560,7 @@ export class Session {
   }
 
   private initializePublishPolicy22(sub: SubscriptionStateMachine, parameters: Parameters, properties: TrackProperties | undefined): void {
+    sub.currentPriority = parameters.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0] as Varint ?? varint(128n);
     const filter = parameters.get(MessageParam.SUBSCRIPTION_FILTER)?.[0];
     if (filter instanceof Uint8Array) sub.currentFilter = filter;
     const order = parameters.get(MessageParam.GROUP_ORDER)?.[0];
@@ -2561,6 +2715,9 @@ export class Session {
     const filterError = this.rejectUnsupportedRangeFilters(msg.requestId, msg.parameters);
     if (filterError) return filterError;
 
+    const relativeError = this.rejectRelativeFetchFilter(msg, validated.replenish);
+    if (relativeError) return relativeError;
+
     // Joining Fetch (0x2/0x3): enforce the MUSTs decidable from protocol state
     // BEFORE creating any fetch state (§9.16.2 / draft-18 §10.12.2).
     if (msg.fetch.fetchType !== 0x1) {
@@ -2645,7 +2802,8 @@ export class Session {
         joiningRequestId: joiningReqId,
         joiningStart: jf.joiningStart,
       });
-      this.incomingFetches.set(msg.requestId as bigint, fetchSm);
+      fetchSm.currentPriority = msg.parameters.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0] as bigint ?? 128n;
+    this.incomingFetches.set(msg.requestId as bigint, fetchSm);
 
       return validated.replenish ?? [];
     }
@@ -2663,6 +2821,7 @@ export class Session {
       sf.endLocation.group,
       sf.endLocation.object,
     );
+    fetchSm.currentPriority = msg.parameters.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0] as bigint ?? 128n;
     this.incomingFetches.set(msg.requestId as bigint, fetchSm);
 
     return validated.replenish ?? [];
@@ -2683,6 +2842,14 @@ export class Session {
    * publisher to save — the current head as the new Joining Location; without
    * this hook a paused track that advanced would resume with a stale one.
    */
+  private fetchLargestLocationProvider: typeof this.largestLocationProvider = null;
+
+  setFetchLargestLocationProvider(provider: NonNullable<typeof this.largestLocationProvider>): void {
+    this.fetchLargestLocationProvider = provider;
+  }
+
+  private readonly updateRevisions = new WeakMap<SubscriptionStateMachine, number>();
+
   private largestLocationProvider: ((subscriptionRequestId: bigint) => { group: bigint; object: bigint } | null) | null = null;
 
   setLargestLocationProvider(provider: (subscriptionRequestId: bigint) => { group: bigint; object: bigint } | null): void {
@@ -2860,7 +3027,9 @@ export class Session {
       && prevForwardState === ForwardState.PAUSED
       && forwardValues !== undefined && forwardValues.length > 0
       && typeof forwardValues[0] === 'bigint' && forwardValues[0] !== 0n;
-    if (wantsResume || (isDraft22(this._draftVersion) && isSubscriptionScope)) {
+    if (this._draftVersion !== 14 && (isSubscriptionScope || fetch)) {
+      const revision = sub ? this.updateRevisions.get(sub) ?? 0 : 0;
+      const provider = fetch ? this.fetchLargestLocationProvider : this.largestLocationProvider;
       // d18 §10.11: "PUBLISH_DONE ... UPDATE_FAILED": an unsuccessful
       // subscription update terminates the subscription. The SESSION emits
       // only the REQUEST_ERROR here — the I/O layer owns the termination
@@ -2869,6 +3038,7 @@ export class Session {
       // stream, none of which bare Session actions can do). The adapter
       // detects the REQUEST_ERROR update response and runs its publishDone.
       const failClosed = (why: string): SessionOutboundAction[] => {
+        if (sub?.isTerminated || (fetch && this.incomingFetches.get(msg.existingRequestId) !== fetch)) return validated.replenish ?? [];
         const reason = `cannot update subscription ${msg.existingRequestId}: ${why} (REQUEST_UPDATE_OK requires the current Largest Location)`;
         return [this.sendControl({
           type: 'REQUEST_ERROR',
@@ -2878,26 +3048,33 @@ export class Session {
           errorReason: reason,
         } as RequestErrorMsg), ...(validated.replenish ?? [])];
       };
-      if (!this.largestLocationProvider) {
+      if (!provider) {
         return failClosed('no Largest Location provider is installed');
       }
       let provided: { group: bigint; object: bigint } | null;
       try {
-        provided = this.largestLocationProvider(msg.existingRequestId as bigint);
-      } catch (err) {
-        return failClosed(`the Largest Location provider threw (${err instanceof Error ? err.message : String(err)})`);
+        provided = provider(msg.existingRequestId as bigint);
+      } catch {
+        return failClosed('the Largest Location provider failed');
       }
+      if (sub?.isTerminated || (fetch && this.incomingFetches.get(msg.existingRequestId) !== fetch)) return validated.replenish ?? [];
+      if (sub && (this.updateRevisions.get(sub) ?? 0) !== revision) return failClosed('subscription changed during head lookup');
+      if (sub) this.updateRevisions.set(sub, revision + 1);
       if (provided === null) {
         resumeClearsStale = true;
       } else if (typeof provided === 'object' && provided !== null
           && typeof provided.group === 'bigint' && typeof provided.object === 'bigint'
           && provided.group >= 0n && provided.object >= 0n
-          && provided.group <= MAX_VI64 && provided.object <= MAX_VI64) {
+          && provided.group <= (this._draftVersion === 16 ? (1n << 62n) - 1n : MAX_VI64)
+          && provided.object <= (this._draftVersion === 16 ? (1n << 62n) - 1n : MAX_VI64)) {
         resumeLocation = { group: provided.group, object: provided.object };
       } else {
         return failClosed('the Largest Location provider returned an invalid value');
       }
     }
+    const priority = msg.parameters.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0];
+    if (fetch && typeof priority === 'bigint') fetch.currentPriority = priority;
+    if (sub && typeof priority === 'bigint') sub.currentPriority = varint(priority);
     // Apply FORWARD parameter if present
     if (forwardValues && forwardValues.length > 0 && sub) {
       const forwardVal = forwardValues[0];
@@ -2922,10 +3099,10 @@ export class Session {
         sub.setRemoteFilterType(decodeSubscriptionFilter(updatedFilter, this._draftVersion).type);
       } catch { /* malformed bytes were already rejected by parameter validation */ }
     }
-    if (isDraft22(this._draftVersion) && isSubscriptionScope && sub && updatedFilter instanceof Uint8Array) {
+    if (isSubscriptionScope && sub && updatedFilter instanceof Uint8Array) {
       sub.locationWindow = subscriptionWindow(
-        sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, 22),
-        resumeLocation ?? undefined,
+        sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, this._draftVersion),
+        resumeLocation ?? undefined, this._draftVersion,
       );
     }
 
@@ -2947,9 +3124,12 @@ export class Session {
     // Communicate + SAVE the pre-validated resume location (see above).
     const requestOkParams: Parameters = new Map();
     if (resumeLocation) {
-      requestOkParams.set(MessageParam.LARGEST_OBJECT as bigint, [resumeLocation]);
-      this.incomingJoiningLocations.set(msg.existingRequestId as bigint, resumeLocation);
-    } else if (resumeClearsStale) {
+      const loc = resumeLocation;
+      const value = this._draftVersion === 16 ? new Uint8Array(locationEncodingLength(loc)) : loc;
+      if (value instanceof Uint8Array) writeLocation(loc, value, 0);
+      requestOkParams.set(MessageParam.LARGEST_OBJECT as bigint, [value]);
+      if (wantsResume && this._draftVersion === 18) this.incomingJoiningLocations.set(msg.existingRequestId as bigint, resumeLocation);
+    } else if (resumeClearsStale && wantsResume && this._draftVersion === 18) {
       this.incomingJoiningLocations.delete(msg.existingRequestId as bigint);
     }
 
@@ -3023,16 +3203,18 @@ export class Session {
 
     // Overlap is checked against OTHER subscriptions of the SAME type only
     // (§10.18/§10.19 independent overlap spaces), excluding this request itself.
+    // Draft 23 allows overlapping prefixes (§3.6, §4.2).
+    const overlapForbidden = !isDraft23(this._draftVersion);
     if (incNs) {
-      for (const [rid, existing] of this.incomingNamespaceSubscriptions) {
+      for (const [rid, existing] of overlapForbidden ? this.incomingNamespaceSubscriptions : []) {
         if (rid === existingRid || existing.isTerminated) continue;
         if (prefixesOverlap(existing.namespacePrefix, newPrefix)) {
           return this.prefixOverlapError(msg.requestId, 'SUBSCRIBE_NAMESPACE', existingRid, replenish);
         }
       }
-      incNs.updatePrefix(newPrefix);
+      incNs.updatePrefix(newPrefix, this._draftVersion);
     } else if (incTracks) {
-      for (const [rid, existing] of this.incomingTrackSubscriptions) {
+      for (const [rid, existing] of overlapForbidden ? this.incomingTrackSubscriptions : []) {
         if (rid === existingRid) continue;
         if (prefixesOverlap(existing.trackNamespacePrefix, newPrefix)) {
           return this.prefixOverlapError(msg.requestId, 'SUBSCRIBE_TRACKS', existingRid, replenish);
@@ -3135,7 +3317,7 @@ export class Session {
     const filterBytes = options.subscriptionFilter === undefined
       ? undefined : encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
     const fillBytes = options.fill === undefined
-      ? undefined : encodeFillParameters(options.fill.filter, options.fill.groupOrder);
+      ? undefined : encodeFillParameters(options.fill.filter, options.fill.groupOrder, options.fill.subscriberPriority);
     const parameters = authorizationParameters(options);
 
     const requestId = this.requestIdAllocator.allocate();
@@ -3258,6 +3440,9 @@ export class Session {
         if (values !== undefined) parameters.set(key, values);
       }
       parameters.set(MessageParam.FORWARD, [varint(BigInt(tracks.forward))]);
+      // draft-23 §9.19.21: name the SUBSCRIBE_TRACKS this PUBLISH answers, since
+      // overlapping SUBSCRIBE_TRACKS each get their own PUBLISH (§3.6).
+      if (isDraft23(this._draftVersion)) parameters.set(SUBSCRIBE_TRACKS_ID, [varint(options.subscribeTracksRequestId)]);
       options = { ...options, parameters };
     }
     this.assertPublisherAliasAvailable(trackAlias, namespace, name);
@@ -3273,6 +3458,7 @@ export class Session {
 
     const sub = SubscriptionStateMachine.createAsPublisher(requestId, namespace, name);
     sub.setOutboundPublishAlias(trackAlias);
+    sub.currentPriority = varint(128n);
     // §5.1 (d18:1948): "A publisher MUST save the Largest Location
     // communicated in ... PUBLISH" — it is this subscription's Joining
     // Location, exactly as with SUBSCRIBE_OK.
@@ -3361,22 +3547,25 @@ export class Session {
    * (draft-14 applies the change inline with no pending record; a draft-14 update
    * send failure is a control-stream error handled session-fatally.)
    */
-  rollbackRequestUpdate(requestId: bigint): void {
+  rollbackRequestUpdate(requestId: bigint): boolean {
+    const reclaimed = this.requestIdAllocator.releaseUnsent(requestId);
     this.pendingUpdates.delete(requestId as bigint);
     this.fillRequests.delete(requestId as bigint);
+    return reclaimed;
   }
 
   private validateUpdateContext22(params: Parameters, requestType: string): SessionOutboundAction[] | undefined {
     if (!isDraft22(this._draftVersion)) return undefined;
     for (const key of params.keys()) {
-      const scopes = VALID_PARAMS_FOR_MESSAGE_TYPE_22.get(key);
+      const scopes = (isDraft23(this._draftVersion) ? VALID_PARAMS_FOR_MESSAGE_TYPE_23 : VALID_PARAMS_FOR_MESSAGE_TYPE_22).get(key);
       if (!scopes) continue;
       const prefixUpdate = key === MessageParam.TRACK_NAMESPACE_PREFIX
         && (requestType === 'SUBSCRIBE_NAMESPACE' || requestType === 'SUBSCRIBE_TRACKS');
       const subscriptionOnly = key === FILL_PARAMETERS || key === MessageParam.SUBSCRIPTION_FILTER
         || (key >= 0x25n && key <= 0x28n);
       if (!prefixUpdate && (!scopes.has(requestType) || (requestType === 'FETCH' && subscriptionOnly))) {
-        return this.closeWithError(SessionErrorCode.PROTOCOL_VIOLATION,
+        return this.closeWithError(
+          isDraft23(this._draftVersion) ? SessionErrorCode.INVALID_PARAMETER : SessionErrorCode.PROTOCOL_VIOLATION,
           `Parameter 0x${key.toString(16)} is out of scope for REQUEST_UPDATE on ${requestType} (9.20)`);
       }
     }
@@ -3393,6 +3582,7 @@ export class Session {
     options: RequestUpdateOptions = {},
   ): RequestResult {
     this.assertEstablishedOrDraining('requestUpdate');
+    if (options.subscriberPriority !== undefined && (options.subscriberPriority < 0n || options.subscriberPriority > 255n)) throw new RangeError('Update priority must be between 0 and 255');
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
     // draft-22 §9.1.7: never more than the peer's MAX_REQUEST_UPDATES unanswered
     // updates on one request stream; each REQUEST_OK / REQUEST_ERROR restores one.
@@ -3420,6 +3610,21 @@ export class Session {
       return this.requestUpdatePrefix(existingRequestId, options);
     }
 
+    const fetch = this.fetches.get(existingRequestId);
+    if (fetch) {
+      if (this._draftVersion === 14 || fetch.isCompleted) throw new SessionError('FETCH is not updatable', 'INVALID_STATE');
+      const allowed = new Set(['subscriberPriority', 'authTokens']);
+      if (Object.keys(options).some(key => !allowed.has(key) && options[key as keyof RequestUpdateOptions] !== undefined)) {
+        throw new SessionError('Only priority and authorization can update FETCH', 'INVALID_STATE');
+      }
+      if (options.subscriberPriority !== undefined) parameters.set(MessageParam.SUBSCRIBER_PRIORITY, [options.subscriberPriority]);
+      const requestId = this.requestIdAllocator.allocate();
+      this.pendingUpdates.set(requestId, { existingRequestId, ...(options.subscriberPriority !== undefined ? { subscriberPriority: options.subscriberPriority } : {}) });
+      return { requestId, actions: [this.sendControl({ type: 'REQUEST_UPDATE', requestId, existingRequestId, parameters })] };
+    }
+    if (this._draftVersion === 16 && this.incomingSubscriptions.get(existingRequestId)?.isPublishInitiated) {
+      return this.updateIncomingSubscription(existingRequestId, options);
+    }
     const sub = this.subscriptions.get(existingRequestId as bigint);
     if (!sub) {
       throw new SessionError(
@@ -3452,7 +3657,7 @@ export class Session {
     const filterBytes = options.subscriptionFilter === undefined ? undefined
       : encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
     const fillBytes = options.fill === undefined ? undefined
-      : encodeFillParameters(options.fill.filter, options.fill.groupOrder);
+      : encodeFillParameters(options.fill.filter, options.fill.groupOrder, options.fill.subscriberPriority);
     if (options.subgroupDeliveryTimeout !== undefined && !isRequestStreamDraft(this._draftVersion)) {
       throw new SessionError('subgroupDeliveryTimeout (SUBGROUP_DELIVERY_TIMEOUT, 0x06) is draft-18 only', 'INVALID_STATE');
     }
@@ -3472,7 +3677,7 @@ export class Session {
     // SUBSCRIBER_PRIORITY parameter
     if (options.subscriberPriority !== undefined) {
       parameters.set(MessageParam.SUBSCRIBER_PRIORITY, [options.subscriberPriority]);
-      sub.currentPriority = options.subscriberPriority;
+      if (this._draftVersion === 14) sub.currentPriority = options.subscriberPriority;
     } else if (this._draftVersion === 14 && sub.currentPriority !== undefined) {
       // Draft-14 §9.10: Subscriber Priority is a mandatory inline field.
       // Replay current value to avoid resetting to codec default (128).
@@ -3483,7 +3688,7 @@ export class Session {
     if (filterBytes !== undefined) {
       parameters.set(MessageParam.SUBSCRIPTION_FILTER, [filterBytes]);
       // Update stored filter for future draft-14 replays
-      if (!isDraft22(this._draftVersion)) sub.currentFilter = filterBytes;
+      if (this._draftVersion === 14) sub.currentFilter = filterBytes;
     } else if (this._draftVersion === 14 && sub.currentFilter) {
       // Draft-14 §9.10: Start Location and End Group are mandatory inline fields.
       // If no new filter specified, replay the current filter to avoid widening.
@@ -3512,7 +3717,7 @@ export class Session {
         sub.updateForwardState(requestedForward);
       }
       if (options.subscriptionFilter !== undefined) {
-        sub.locationWindow = subscriptionWindow(options.subscriptionFilter, undefined);
+        sub.locationWindow = subscriptionWindow(options.subscriptionFilter, undefined, this._draftVersion);
       }
       if (options.objectDeliveryTimeout !== undefined) {
         sub.requestedDeliveryTimeoutMs = Number(options.objectDeliveryTimeout);
@@ -3523,7 +3728,7 @@ export class Session {
       const pending: {
         existingRequestId: bigint; forward?: ForwardStateValue;
         objectDeliveryTimeoutMs?: number; subgroupDeliveryTimeoutMs?: number;
-        subscriptionFilter?: Uint8Array;
+        subscriptionFilter?: Uint8Array; subscriberPriority?: Varint;
       } = { existingRequestId: existingRequestId as bigint };
       if (requestedForward !== undefined) {
         pending.forward = requestedForward;
@@ -3533,6 +3738,7 @@ export class Session {
       if (options.subscriptionFilter !== undefined) {
         pending.subscriptionFilter = parameters.get(MessageParam.SUBSCRIPTION_FILTER)![0] as Uint8Array;
       }
+      if (options.subscriberPriority !== undefined) pending.subscriberPriority = options.subscriberPriority;
       this.pendingUpdates.set(requestId as bigint, pending);
     }
 
@@ -3708,6 +3914,12 @@ export class Session {
   joiningFetch(options: JoiningFetchOptions): RequestResult {
     this.assertEstablishedOrDraining('joiningFetch');
     const parameters = authorizationParameters(options);
+    if (options.subscriberPriority !== undefined) {
+      if (options.subscriberPriority < 0n || options.subscriberPriority > 255n) {
+        throw new RangeError(`SUBSCRIBER_PRIORITY must be 0-255, got ${options.subscriberPriority}`);
+      }
+      parameters.set(MessageParam.SUBSCRIBER_PRIORITY, [options.subscriberPriority]);
+    }
 
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(
@@ -3745,6 +3957,7 @@ export class Session {
       joiningRequestId: options.joiningRequestId,
       joiningStart: options.joiningStart,
     }, sub.trackKey);
+    fetchSm.currentPriority = options.subscriberPriority ?? 128n;
     this.fetches.set(requestId as bigint, fetchSm);
 
     // No width narrowing here: the field is vi64 on draft-18 (a peer-allocated
@@ -4420,6 +4633,11 @@ export class Session {
           nsSm.namespacePrefix, nsMsg.trackNamespaceSuffix,
         );
         if (nsValidationError) return nsValidationError;
+        // draft-23 §9.15: NAMESPACE carries Parameters, but none are defined for it.
+        if (isDraft23(this._draftVersion) && (nsMsg.parameters?.size ?? 0) > 0) {
+          const paramError = this.validateMessageParams(nsMsg.parameters!, 'NAMESPACE');
+          if (paramError) return this.closeWithError(paramError.error, paramError.reason);
+        }
         nsSm.handleNamespace(nsMsg.trackNamespaceSuffix);
         return [];
       }
@@ -4436,11 +4654,14 @@ export class Session {
         // 'PROTOCOL_VIOLATION'."
         if (!nsSm.hasDiscoveredSuffix(ndMsg.trackNamespaceSuffix)) {
           return this.closeWithError(
-            SessionErrorCode.PROTOCOL_VIOLATION,
+            // draft-23 §12.2: a message in the wrong order is UNEXPECTED_MESSAGE.
+            isDraft23(this._draftVersion) ? SessionErrorCode.UNEXPECTED_MESSAGE : SessionErrorCode.PROTOCOL_VIOLATION,
             `NAMESPACE_DONE for suffix not previously announced via NAMESPACE (§6.1)`,
           );
         }
-        nsSm.handleNamespaceDone();
+        // DONE withdraws only this suffix; discovery continues (d16 §9.23,
+        // d18 §10.17–10.18, d22 §4.2).
+        nsSm.withdrawNamespace(ndMsg.trackNamespaceSuffix);
         return [];
       }
 
@@ -4531,8 +4752,10 @@ export class Session {
       return [this.sendControl(okMsg), notifyAction, ...(validated.replenish ?? [])];
     }
 
-    // Match found — record the announced namespace.
-    match.nsSm.handleNamespace(msg.trackNamespace);
+    // Match found — record the announced namespace. Draft 23 allows overlapping
+    // namespace subscriptions (§4.2), so every one that matches sees it.
+    const matches = isDraft23(this._draftVersion) ? this.findNamespaceSubscriptionsByPrefix(msg.trackNamespace) : [match];
+    for (const m of matches) m.nsSm.handleNamespace(msg.trackNamespace);
     if (isRequestStreamDraft(this._draftVersion)) {
       this.incomingPublishNamespaces.set(msg.requestId as bigint, { namespace: msg.trackNamespace });
     }
@@ -4541,13 +4764,13 @@ export class Session {
       ? { type: 'PUBLISH_NAMESPACE_OK', requestId: msg.requestId }
       : { type: 'REQUEST_OK', requestId: msg.requestId, parameters: new Map() };
 
-    const notifyAction: NotifyNamespaceAction = {
+    const notifyActions: NotifyNamespaceAction[] = matches.map((m) => ({
       type: 'notify_namespace',
-      requestId: match.nsSm.requestId,
+      requestId: m.nsSm.requestId,
       message: msg,
-    };
+    }));
 
-    return [this.sendControl(okMsg), notifyAction, ...(validated.replenish ?? [])];
+    return [this.sendControl(okMsg), ...notifyActions, ...(validated.replenish ?? [])];
   }
 
   /**
@@ -4563,8 +4786,10 @@ export class Session {
     const entry = this.incomingPublishNamespaces.get(requestId as bigint);
     if (!entry) return [];
     this.incomingPublishNamespaces.delete(requestId as bigint);
-    const match = this.findNamespaceSubscriptionByPrefix(entry.namespace);
-    if (match) match.nsSm.withdrawNamespace(entry.namespace);
+    const matches = isDraft23(this._draftVersion)
+      ? this.findNamespaceSubscriptionsByPrefix(entry.namespace)
+      : [this.findNamespaceSubscriptionByPrefix(entry.namespace)];
+    for (const match of matches) match?.nsSm.withdrawNamespace(entry.namespace);
     return [];
   }
 
@@ -4600,7 +4825,8 @@ export class Session {
     if (reserved) return reserved;
 
     // Reject a prefix that overlaps an existing non-terminated incoming sub.
-    for (const existing of this.incomingNamespaceSubscriptions.values()) {
+    // Draft 23 allows overlapping SUBSCRIBE_NAMESPACE prefixes (§4.2).
+    for (const existing of isDraft23(this._draftVersion) ? [] : this.incomingNamespaceSubscriptions.values()) {
       if (existing.isTerminated) continue;
       if (prefixesOverlap(existing.namespacePrefix, msg.trackNamespacePrefix)) {
         const errorMsg: RequestErrorMsg = {
@@ -4670,12 +4896,8 @@ export class Session {
 
   /**
    * Publisher-side: emit NAMESPACE_DONE for a previously announced suffix on an
-   * accepted incoming SUBSCRIBE_NAMESPACE stream (§10.18). Locally this is a
-   * PER-SUFFIX withdrawal from our publisher bookkeeping (via `withdrawNamespace`,
-   * NOT the terminal `NamespaceStateMachine.sendNamespaceDone()`), so our incoming
-   * machine stays ACTIVE and may emit further NAMESPACE / NAMESPACE_DONE. The
-   * RECEIVING subscriber, however, treats NAMESPACE_DONE as TERMINATING its
-   * namespace subscription (§6.1, `handleNamespaceDone`).
+   * accepted incoming SUBSCRIBE_NAMESPACE stream (d18 §10.18). Both endpoints
+   * keep discovery ACTIVE while withdrawing only this suffix.
    */
   sendNamespaceDone(requestId: bigint, suffix: Uint8Array[]): SessionOutboundAction[] {
     const nsSm = this.requireActiveIncomingNamespaceSub(requestId, 'sendNamespaceDone');
@@ -4728,6 +4950,15 @@ export class Session {
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
 
+    // Draft 23 §1.6 / §12.3: refuse unsupported fills rather than promise them.
+    if (isDraft23(this._draftVersion) && msg.parameters.has(FILL_PARAMETERS)) {
+      return [this.sendControl({
+        type: 'REQUEST_ERROR', requestId: msg.requestId,
+        errorCode: RequestErrorCode.NOT_SUPPORTED, retryInterval: varint(0n),
+        errorReason: 'SUBSCRIBE_TRACKS fills are not supported',
+      }), ...(validated.replenish ?? [])];
+    }
+
     const filterError = this.rejectUnsupportedRangeFilters(msg.requestId, msg.parameters);
     if (filterError) return filterError;
 
@@ -4746,7 +4977,8 @@ export class Session {
 
     // Overlap is checked ONLY against other incoming SUBSCRIBE_TRACKS — a
     // SUBSCRIBE_TRACKS prefix may coexist with a SUBSCRIBE_NAMESPACE prefix.
-    for (const existing of this.incomingTrackSubscriptions.values()) {
+    // Draft 23 allows overlapping SUBSCRIBE_TRACKS prefixes (§3.6).
+    for (const existing of isDraft23(this._draftVersion) ? [] : this.incomingTrackSubscriptions.values()) {
       if (prefixesOverlap(existing.trackNamespacePrefix, msg.trackNamespacePrefix)) {
         const errorMsg: RequestErrorMsg = {
           type: 'REQUEST_ERROR',
@@ -5145,7 +5377,17 @@ export class Session {
   private findNamespaceSubscriptionByPrefix(
     namespace: Uint8Array[],
   ): { nsSm: NamespaceStateMachine } | undefined {
+    return this.findNamespaceSubscriptionsByPrefix(namespace, 1)[0];
+  }
+
+  /** Every active outgoing namespace subscription whose prefix matches `namespace` (at most `limit`). */
+  private findNamespaceSubscriptionsByPrefix(
+    namespace: Uint8Array[],
+    limit = Infinity,
+  ): { nsSm: NamespaceStateMachine }[] {
+    const found: { nsSm: NamespaceStateMachine }[] = [];
     for (const nsSm of this.namespaceSubscriptions.values()) {
+      if (found.length >= limit) break;
       if (!nsSm.isActive) continue;
 
       const prefix = nsSm.namespacePrefix;
@@ -5161,9 +5403,9 @@ export class Session {
         if (!matches) break;
       }
 
-      if (matches) return { nsSm };
+      if (matches) found.push({ nsSm });
     }
-    return undefined;
+    return found;
   }
 
   // ─── Publisher-Side Operations ───────────────────────────────────────
@@ -5284,10 +5526,12 @@ export class Session {
 
     if (isDraft22(this._draftVersion)) {
       sub.publisherGroupOrder = trackProperties.get(0x22n)?.[0] === 2n ? 'descending' : 'ascending';
-      sub.locationWindow = subscriptionWindow(
-        sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, 22), communicated ?? undefined,
-      );
     }
+    // d14 §9.7 / d16 §9.9 / d18 §5.1.2: publisher sends stay inside the requested range.
+    sub.locationWindow = subscriptionWindow(
+      sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, this._draftVersion),
+      communicated ?? undefined, this._draftVersion,
+    );
 
     const subscribeOk: SubscribeOk = {
       type: 'SUBSCRIBE_OK',
@@ -5363,12 +5607,16 @@ export class Session {
    */
   handleInboundPublishDone(requestId: bigint): SessionOutboundAction[] {
     const sub = this.incomingSubscriptions.get(requestId as bigint);
-    if (!sub) {
+    if (!sub || !sub.isPublishInitiated) {
       return this.closeWithError(
         SessionErrorCode.INVALID_REQUEST_ID,
         `Unknown PUBLISH ${requestId} for PUBLISH_DONE`,
       );
     }
+    const pending = sub.isPending;
+    if (pending) sub.sendRequestError(0n, 'Publication ended before acceptance');
+    else sub.sendPublishDone(varint(0n), 'Publication ended');
+    this.dropPendingUpdatesFor(requestId);
     // Release the publisher-chosen Track Alias from the session registry so a
     // later PUBLISH may reuse it (the I/O layer keeps its own bounded tombstone
     // to discard late streams — that is a separate, adapter-level concern).
@@ -5377,7 +5625,9 @@ export class Session {
     this.incomingJoiningLocations.delete(requestId as bigint);
     // §5.1: PUBLISH ended before acceptance — discard any staged collision.
     this.pendingCollisions.delete(requestId as bigint);
-    return [];
+    // d16 §5.1: a pending PUBLISH still requires exactly one response.
+    return pending && this._draftVersion === 16
+      ? [this.sendControl({ type: 'REQUEST_ERROR', requestId, errorCode: varint(0n), retryInterval: varint(0n), errorReason: 'Publication ended before acceptance' })] : [];
   }
 
   /**
@@ -5399,6 +5649,10 @@ export class Session {
         'INVALID_STATE',
       );
     }
+    if (!sub.isPublishInitiated || options.trackNamespacePrefix !== undefined
+        || (this._draftVersion === 16 && options.subgroupDeliveryTimeout !== undefined)) {
+      throw new SessionError('Invalid incoming publication update', 'INVALID_STATE');
+    }
     if (sub.state !== 'established') {
       throw new SessionError(
         `Cannot update incoming subscription in state ${sub.state}; expected established`,
@@ -5415,7 +5669,7 @@ export class Session {
       if (BigInt(pending) >= this._peerMaxRequestUpdates) throw new SessionError('MAX_REQUEST_UPDATES exceeded', 'INVALID_STATE');
     }
     const filterBytes = options.subscriptionFilter === undefined ? undefined : encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
-    const fillBytes = options.fill === undefined ? undefined : encodeFillParameters(options.fill.filter, options.fill.groupOrder);
+    const fillBytes = options.fill === undefined ? undefined : encodeFillParameters(options.fill.filter, options.fill.groupOrder, options.fill.subscriberPriority);
     const parameters = authorizationParameters(options);
     const requestId = this.requestIdAllocator.allocate();
     if (filterBytes !== undefined) parameters.set(MessageParam.SUBSCRIPTION_FILTER, [filterBytes]);
@@ -5440,7 +5694,8 @@ export class Session {
     // Stage ALL changes on the pending record — applied on REQUEST_OK, never at send.
     this.pendingUpdates.set(requestId as bigint, {
       existingRequestId,
-      ...(isDraft22(this._draftVersion) && filterBytes !== undefined ? { subscriptionFilter: filterBytes } : {}),
+      ...(filterBytes !== undefined ? { subscriptionFilter: filterBytes } : {}),
+      ...(options.subscriberPriority !== undefined ? { subscriberPriority: options.subscriberPriority } : {}),
       ...(requestedForward !== undefined
         ? { forward: requestedForward }
         : {}),
@@ -5514,9 +5769,27 @@ export class Session {
       );
     }
 
+    if (isDraft23(this._draftVersion) && (options.endOfTrack ?? 0) !== 0) {
+      // draft-23 §11.4.2.2: End Of Track moved to the data stream. Refuse it
+      // rather than drop it, so the fetcher still learns where the Track ends.
+      throw new SessionError(
+        'draft 23 has no End Of Track in the FETCH response; send an End of Track marker on the data stream (sendFetchEndMarker)',
+        'INVALID_STATE',
+      );
+    }
+    // Draft 23 §3.2: report Largest Object when it lies in the requested range.
+    if (isDraft23(this._draftVersion) && options.largestObject === undefined
+      && !options.parameters?.has(MessageParam.LARGEST_OBJECT as bigint)) {
+      const largestObject = this.fetchLargestLocationProvider?.(requestId);
+      if (largestObject === null) {
+        return this.rejectFetch(requestId, RequestErrorCode.INVALID_RANGE, 'No Objects published for this track');
+      }
+      if (largestObject != null) options = { ...options, largestObject };
+    }
     const trackProperties = this.resolveTrackProperties(options.trackProperties, 'FETCH_OK');
     let endLocation = options.endLocation;
-    if (endLocation === undefined) {
+    // draft 23 answers with REQUEST_OK, which carries no End Location.
+    if (endLocation === undefined && !isDraft23(this._draftVersion)) {
       if (fetch.endGroup === undefined) {
         throw new SessionError('FETCH response End Location is required until the joining range is resolved', 'INVALID_STATE');
       }
@@ -5524,23 +5797,33 @@ export class Session {
         : { group: fetch.endGroup, object: fetch.endObject ?? 0n };
     }
 
-    fetch.sendFetchOk();
+    const response: FetchOk | RequestOk = isDraft23(this._draftVersion)
+      ? {
+        // draft-23 §9.3: a FETCH is answered with REQUEST_OK. End Of Track moves to
+        // the data stream (an End of Track marker, §11.4.2.2).
+        type: 'REQUEST_OK',
+        requestId,
+        parameters: fetchOkParameters23(fetch, options),
+        trackProperties,
+      }
+      : {
+        type: 'FETCH_OK',
+        requestId,
+        endOfTrack: options.endOfTrack ?? 0,
+        endLocation: endLocation!,
+        parameters: options.parameters ?? new Map(),
+        trackProperties,
+      };
 
-    const fetchOk: FetchOk = {
-      type: 'FETCH_OK',
-      requestId,
-      endOfTrack: options.endOfTrack ?? 0,
-      endLocation: endLocation!,
-      parameters: options.parameters ?? new Map(),
-      trackProperties,
-    };
+    // Validate all response metadata before committing the response state (§3.2).
+    fetch.sendFetchOk();
 
     // §10.13: the response stream may have closed BEFORE this FETCH_OK. If so, both
     // are now done — reclaim the served fetch; otherwise keep it (reclaimServedFetch
     // reclaims when the data stream later closes).
     if (fetch.isPublisherComplete) this.incomingFetches.delete(requestId as bigint);
 
-    return [this.sendControl(fetchOk)];
+    return [this.sendControl(response)];
   }
 
   /**
@@ -5750,7 +6033,9 @@ export class Session {
       return true;
     }
 
-    const table = isDraft22(this._draftVersion)
+    const table = isDraft23(this._draftVersion)
+      ? VALID_PARAMS_FOR_MESSAGE_TYPE_23
+      : isDraft22(this._draftVersion)
       ? VALID_PARAMS_FOR_MESSAGE_TYPE_22
       : isRequestStreamDraft(this._draftVersion)
         ? VALID_PARAMS_FOR_MESSAGE_TYPE_18
@@ -5769,10 +6054,40 @@ export class Session {
     })];
   }
 
-  /** Validate parameter scope, multiplicity, and values using the selected draft. */
+  /**
+   * draft-23 §3.2: a FETCH whose Location Filter is relative to the Largest
+   * Object gets REQUEST_ERROR INVALID_RANGE. Draft 22 leaves such a filter for
+   * the receiver to resolve.
+   */
+  private rejectRelativeFetchFilter(msg: Fetch, replenish?: SessionOutboundAction[]): SessionOutboundAction[] | undefined {
+    if (!isDraft23(this._draftVersion)) return undefined;
+    const filter = msg.parameters.get(MessageParam.SUBSCRIPTION_FILTER as bigint)?.[0];
+    if (!(filter instanceof Uint8Array) || !isRelativeLocationFilter(filter)) return undefined;
+    return [this.sendControl({ type: 'REQUEST_ERROR', requestId: msg.requestId,
+      errorCode: RequestErrorCode.INVALID_RANGE, retryInterval: varint(0n),
+      errorReason: 'A FETCH Location Filter cannot be relative to the Largest Object (3.2)',
+      requestKind: 'FETCH',
+    }), ...(replenish ?? [])];
+  }
+
+  /**
+   * Validate parameter scope, multiplicity, and values using the selected draft.
+   * Draft 23 closes with INVALID_PARAMETER where earlier drafts use
+   * PROTOCOL_VIOLATION (§9.19, §9.19.1).
+   */
   private validateMessageParams(params: Parameters, messageType: string): { error: Varint; reason: string } | undefined {
+    const error = this.validateMessageParamsForDraft(params, messageType);
+    if (error && isDraft23(this._draftVersion) && error.error === SessionErrorCode.PROTOCOL_VIOLATION) {
+      return { error: SessionErrorCode.INVALID_PARAMETER, reason: error.reason };
+    }
+    return error;
+  }
+
+  private validateMessageParamsForDraft(params: Parameters, messageType: string): { error: Varint; reason: string } | undefined {
     const isDraft18 = isRequestStreamDraft(this._draftVersion);
-    const knownParams = isDraft22(this._draftVersion)
+    const knownParams = isDraft23(this._draftVersion)
+      ? KNOWN_MESSAGE_PARAMS_23
+      : isDraft22(this._draftVersion)
       ? KNOWN_MESSAGE_PARAMS_22
       : isDraft18 ? KNOWN_MESSAGE_PARAMS_18 : KNOWN_MESSAGE_PARAMS;
     for (const [key, values] of params) {

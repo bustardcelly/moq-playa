@@ -1,3 +1,4 @@
+import { publicationState, type PublicationConnection } from '../shared/publication-state.js';
 /**
  * One broadcast generation, session-local and DOM-free.
  *
@@ -16,7 +17,7 @@ import type { MediaPublishConnection, MediaPublisherOptions } from './media-publ
 import { TimelinePublisher } from './timeline-publisher.js';
 
 /** The subset of MoqtConnection a broadcast generation uses. */
-export interface BroadcastSessionConnection extends MediaPublishConnection {
+export interface BroadcastSessionConnection extends MediaPublishConnection, PublicationConnection {
   acceptSubscribe(requestId: unknown, alias: unknown): Promise<void>;
   rejectSubscribe(requestId: unknown, errorCode: unknown, reason: string): Promise<void>;
   /** Terminal for a subscription accepted but not servable (catalog transaction). */
@@ -74,6 +75,7 @@ export class BroadcastSession {
       assertPositiveFinite(opts.shutdownGraceMs, 'shutdownGraceMs');
     }
     this.connection = connection;
+    publicationState(connection);
     this.opts = opts;
     this.wrapInt = opts.publisher.wrapInt;
     this.timeline = new TimelinePublisher(connection, {
@@ -85,6 +87,7 @@ export class BroadcastSession {
       ...opts.publisher,
       onVideoGroup: (group) => this.timeline.noteGroup(group),
     // The catalog's codecs ride as the LOC-05 Codec String unless the caller set them.
+      onObject: (alias, group, object) => publicationState(connection).sent(alias, group, object),
       codecStrings: {
         video: opts.catalog.videoCodec,
         ...(opts.catalog.audio ? { audio: 'opus' } : {}),
@@ -109,12 +112,13 @@ export class BroadcastSession {
       this.safeLog(`Failed to serve "${trackName}" subscription: ${(err as Error)?.message ?? err}`);
     };
 
+    if (trackName === 'catalog' || trackName === 'video' || trackName === 'audio') publicationState(this.connection).bind(requestId, alias);
     if (trackName === 'catalog') {
       // Catalog publication is SESSION-OWNED work: tracked so shutdown()
       // accounts for it; the retired-guard keeps a stale completion from
       // touching a replacement generation's UI.
       const work = acceptCatalogSubscribe(
-        this.connection as never, requestId, alias, this.opts.catalog, { draft: this.opts.publisher.draft })
+        this.connection as never, requestId, alias, this.opts.catalog, { draft: this.opts.publisher.draft, onObject: group => publicationState(this.connection).sent(alias, group, 0n) })
         .then((bytes) => {
           this.safeLog(`Catalog published (${bytes} bytes)`);
           if (!this.retired) this.opts.onCatalogPublished?.(bytes);
@@ -158,6 +162,7 @@ export class BroadcastSession {
 
   /** §5.1.1: stop queued publication for the cancelled request; the adapter resets its streams. */
   handleSubscribeClosed(requestId: bigint): void {
+    publicationState(this.connection).remove(requestId);
     for (const [track, subscription] of this.mediaSubscriptions) {
       if (subscription.requestId !== requestId) continue;
       this.mediaSubscriptions.delete(track);
@@ -175,6 +180,7 @@ export class BroadcastSession {
   handleClose(error?: number, reason?: string): void {
     if (this.retired) return;
     this.retired = true;
+    publicationState(this.connection).retire();
     this.mediaSubscriptions.clear();
     this.publisher.retire();
     this.timeline.retire();
@@ -225,6 +231,7 @@ export class BroadcastSession {
 
   private async runShutdown(): Promise<void> {
     this.retired = true;
+    publicationState(this.connection).retire();
     this.mediaSubscriptions.clear();
     this.publisher.retire();
     this.timeline.retire();

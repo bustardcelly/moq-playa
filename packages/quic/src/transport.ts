@@ -22,7 +22,7 @@ interface MoqtSetupRouting {
 }
 
 /** The MOQT ALPN tokens the native binding can negotiate. */
-export type MoqtQuicProtocol = 'moqt-18' | 'moqt-22';
+export type MoqtQuicProtocol = 'moqt-18' | 'moqt-22' | 'moqt-23';
 
 /** Native QUIC transport plus the routing fields required in MOQT SETUP. */
 export interface MoqtQuicTransport extends WebTransportLike {
@@ -173,6 +173,10 @@ export class NodeQuicTransport implements MoqtQuicTransport {
       throw new Error('native QUIC backend returned a non-bidirectional stream');
     }
     return wrapBidirectional(stream);
+  }
+
+  createStreamError(code: number, cause?: unknown): Error {
+    return Object.assign(new Error('Stream cancelled', { cause }), { streamErrorCode: code });
   }
 
   async createUnidirectionalStream(): Promise<WritableStream<Uint8Array>> {

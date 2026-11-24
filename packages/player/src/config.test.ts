@@ -155,6 +155,10 @@ describe('validateConfig', () => {
     expect(() => validateConfig(minConfig({ subscriberPriority: 255 }))).not.toThrow();
   });
 
+  it.each([-1, 256, 1.5])('rejects audioSubscriberPriority %s', value => {
+    expect(() => validateConfig(minConfig({ audioSubscriberPriority: value }))).toThrow(RangeError);
+  });
+
   // ── maxCatchUpRate ──
 
   it('rejects maxCatchUpRate < 1.0', () => {
@@ -411,4 +415,14 @@ describe('catalogBootstrap option', () => {
       catalogBootstrap: 'bogus',
     } as unknown as MoqtPlayerConfig)).toThrow(/catalogBootstrap/);
   });
+});
+
+it('defaults live jumps to 3000 ms, allows disabling and rejects invalid thresholds', () => {
+  expect(DEFAULT_PLAYER_CONFIG.liveJumpThresholdMs).toBe(3000);
+  for (const liveJumpThresholdMs of [0, 500, 3000]) {
+    expect(() => validateConfig(minConfig({ liveJumpThresholdMs }))).not.toThrow();
+  }
+  for (const liveJumpThresholdMs of [-1, NaN, Infinity]) {
+    expect(() => validateConfig(minConfig({ liveJumpThresholdMs }))).toThrow(/liveJumpThresholdMs/);
+  }
 });

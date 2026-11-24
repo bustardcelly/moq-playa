@@ -280,9 +280,22 @@ export interface PlaybackTuningConfig {
   /**
    * Subscriber priority for media subscriptions. Range 0-255, lower = higher priority.
    * Default: omitted (publisher uses 128).
+   * Down-switch targets and their history use one step more urgent than the outgoing
+   * priority, only when still less urgent than audio; otherwise they tie.
+   * No outgoing or post-adoption update is sent. Consecutive down-switches
+   * tie once the audio boundary is reached; an up-switch restores this value.
    * @see draft-ietf-moq-transport-16 §9.2.2.3 (SUBSCRIBER_PRIORITY)
    */
   readonly subscriberPriority?: number;
+
+  /**
+   * Subscriber priority for audio subscriptions (0 = highest, 255 = lowest).
+   * Default: two steps more urgent than `subscriberPriority`, clamped at 0
+   * (126 when unset, against the publisher default of 128 for video). This
+   * expresses a scheduling preference, not a delivery guarantee; priority 0 ties.
+   * @see draft-ietf-moq-transport-16 §9.2.2.3 (SUBSCRIBER_PRIORITY)
+   */
+  readonly audioSubscriberPriority?: number;
 
   /**
    * Group ordering: 'ascending' (0x1) or 'descending' (0x2).
@@ -332,9 +345,14 @@ export interface PlaybackTuningConfig {
 
 /** Latency and catch-up options. */
 export interface LatencyConfig {
+  /** Live LOC buffered-ahead threshold in ms. Default: 3000; 0 disables.
+   * After 1 s above it, jump toward received media with 500 ms headroom, at most
+   * once per 5 s. Flushes queued A/V. Never applies to seeks, VOD or caller ranges.
+   * Also caps cumulative late-audio slips until latency is repaid; 0 permits no slip. */
+  readonly liveJumpThresholdMs?: number;
   /**
    * Target end-to-end latency in milliseconds.
-   * When undefined, uses the catalog's targetLatency or disables catch-up.
+   * Uses the configured/catalog target when output latency is available; media elements use buffer ahead.
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
   readonly targetLatencyMs?: number;
@@ -342,14 +360,16 @@ export interface LatencyConfig {
   /**
    * Maximum playback rate for catch-up (e.g., 1.05 = 5% faster).
    * Default: 1.0 (catch-up disabled).
-   * Must be >= 1.0.
+   * Must be >= 1.0. Live ordinary playback only, through an output that changes
+   * audio and video together. Media elements preserve pitch. LOC requires the
+   * renderer rate hook and timed audio output; WebAudio raises pitch (about
+   * 0.85 semitone at 1.05x). Queued audio and video are retimed together.
    */
   readonly maxCatchUpRate?: number;
 
   /**
-   * Latency threshold in ms before catch-up activates. Default: 500.
-   * Catch-up only kicks in when current latency exceeds
-   * targetLatencyMs + catchUpThresholdMs.
+   * Excess-buffer threshold in ms before catch-up activates. Default: 500.
+   * Uses the least buffer ahead over 2 seconds, less catalog buffers min/target (500 ms if absent).
    */
   readonly catchUpThresholdMs?: number;
 
@@ -367,8 +387,8 @@ export interface LatencyConfig {
   readonly maxDriftMs?: number;
 
   /**
-   * Latency threshold for deactivating catch-up (hysteresis).
-   * Catch-up deactivates when latency drops to targetLatencyMs + catchUpRecoveryMs.
+   * Excess-buffer threshold for deactivating catch-up (hysteresis).
+   * Catch-up stops when standing buffer minus the jitter floor falls to this value.
    * Default: 50ms.
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
@@ -546,11 +566,25 @@ export interface RecoveryConfig {
   readonly locmafDecoding?: 'mse' | 'frame';
 
   /**
+   * Opt into publisher discovery and bound a refused media restart's announcement wait (ms).
+   * A relay announcement permits one DOES_NOT_EXIST retry despite Retry Interval 0:
+   * publisher presence changed. Positive Retry Interval minima still apply.
+   * A refused watch disables discovery for that session. Publishers announcing
+   * only through PUBLISH give no recovery signal. On d14, discovery also forwards
+   * PUBLISH; tracks the application did not request are refused with UNINTERESTED.
+   * Opens one extra SUBSCRIBE_NAMESPACE per session; applications' overlapping
+   * namespace subscriptions can receive PREFIX_OVERLAP. Relay re-announcements
+   * can immediately replace silent media subscriptions. Default: 0 (disabled).
+   * Also bounds the initial catalog announcement wait; positive Retry Intervals remain retryable.
+   */
+  readonly publisherWaitMs?: number;
+
+  /**
    * Media-liveness starvation threshold: while PLAYING, a track with no
    * object arrivals for this long triggers the restart ladder.
    * The gap detector handles gaps BETWEEN arrivals; this handles NO
    * arrivals (transport stream death, relay restart).
-   * Default: 10_000. Set 0 to disable liveness monitoring entirely.
+   * Default: 10_000. Set 0 to disable timer-driven starvation detection.
    */
   readonly livenessTimeoutMs?: number;
 
@@ -791,6 +825,7 @@ export const DEFAULT_PLAYER_CONFIG = {
   driftThresholdMs: 200,
   maxBufferDepth: 500,
 
+  liveJumpThresholdMs: 3000,
   // Latency / catch-up
   maxCatchUpRate: 1.0,
   catchUpThresholdMs: 500,
@@ -813,6 +848,7 @@ export const DEFAULT_PLAYER_CONFIG = {
   cmafFirstFrameMaxWaitMs: 60_000,
 
   // Media liveness (0 disables)
+  publisherWaitMs: 0,
   livenessTimeoutMs: 10_000,
   livenessResetProbeMs: 2_000,
   livenessMaxRestarts: 3,
@@ -951,6 +987,10 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   if (config.authorization && config.connection) {
     throw new TypeError('Configure authorization when connecting an externally owned connection, not on its player');
   }
+  if (config.audioSubscriberPriority !== undefined && (!Number.isInteger(config.audioSubscriberPriority)
+      || config.audioSubscriberPriority < 0 || config.audioSubscriberPriority > 255)) {
+    throw new RangeError(`audioSubscriberPriority must be 0–255, got ${config.audioSubscriberPriority}`);
+  }
   // subscriberPriority: 0–255 (§9.2.2.3)
   if (config.subscriberPriority !== undefined) {
     if (!Number.isInteger(config.subscriberPriority) || config.subscriberPriority < 0 || config.subscriberPriority > 255) {
@@ -968,6 +1008,9 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     throw new RangeError(`reconnectAttempts must be a non-negative integer, got ${config.reconnectAttempts}`);
   }
 
+  if (config.liveJumpThresholdMs !== undefined && (!Number.isFinite(config.liveJumpThresholdMs) || config.liveJumpThresholdMs < 0)) {
+    throw new RangeError('liveJumpThresholdMs must be finite and nonnegative');
+  }
   // All *Ms timeouts > 0
   const msFields: Array<[string, number | undefined]> = [
     ['connectionTimeoutMs', config.connectionTimeoutMs],
@@ -990,6 +1033,10 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     if (value !== undefined && value <= 0) {
       throw new RangeError(`${name} must be > 0, got ${value}`);
     }
+  }
+
+  if (config.publisherWaitMs !== undefined && (!Number.isFinite(config.publisherWaitMs) || config.publisherWaitMs < 0)) {
+    throw new RangeError('publisherWaitMs must be finite and >= 0 (0 disables)');
   }
 
   // livenessTimeoutMs: >= 0 (0 disables the liveness monitor)

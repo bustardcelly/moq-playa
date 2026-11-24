@@ -314,9 +314,17 @@
     <div class="hint">Join mid-group via joining FETCH (live LOC tracks)</div>
     <label for="s-hash">Certificate Hash</label>
     <input id="s-hash" type="text" placeholder="(none)">
+    <label for="s-auth-profile">Token profile</label>
+    <select id="s-auth-profile">
+      <option value="cat4moq">CAT4MOQ (type 1)</option>
+      <option value="moqx-compat">moqx compatibility (type 16)</option>
+    </select>
+    <div class="hint">For a c4m token in an MSF URL: …/player/#msf:&lt;namespace&gt;--catalog&amp;c4m=&lt;token&gt;</div>
     <label for="s-version">Draft Version</label>
     <select id="s-version">
       <option value="">Auto (default moqt-16)</option>
+      <option value="23">Draft 23</option>
+      <option value="22">Draft 22</option>
       <option value="18">Draft 18</option>
       <option value="16">Draft 16</option>
       <option value="14">Draft 14</option>
@@ -351,7 +359,7 @@
 <div class="page">
   <div class="player-wrap" id="player-wrap">
     <canvas id="canvas" width="1920" height="1080"></canvas>
-    <video id="video" hidden autoplay style="max-width:100%;background:#000"></video>
+    <video id="video" hidden style="max-width:100%;background:#000"></video>
 
     <!-- Stats overlay -->
     <div id="stats-overlay" class="stats-overlay">

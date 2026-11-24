@@ -16,7 +16,7 @@ import type { ResolvedTrackNamespace } from './track-identity.js';
  * @see draft-ietf-moq-cmsf-00 §3.5.1 (adds 'cmaf')
  * @see draft-einarsson-moq-locmaf-01 §5 (adds 'locmaf'; CMSF catalogs only)
  */
-export type Packaging = 'loc' | 'mediatimeline' | 'eventtimeline' | 'cmaf' | 'locmaf';
+export type Packaging = 'loc' | 'mediatimeline' | 'eventtimeline' | 'cmaf' | 'locmaf' | 'moqlog' | 'moqmetrics' | 'catalog';
 
 /**
  * MSF-01 media-timeline template (§5.2.15 / §7.4): the inline fixed-duration
@@ -97,6 +97,9 @@ export type TrackRole =
     | 'eventtimeline'
     | 'caption'
     | 'subtitle'
+    | 'data'
+    | 'log'
+    | 'metrics'
     | 'signlanguage'
     | (string & {});
 
@@ -179,13 +182,19 @@ export interface CatalogTrack {
     /** @see draft-ietf-moq-catalogformat-01 §3.2.16 — name of separate initialization track */
     readonly initTrack?: string;
     /** @see draft-ietf-moq-msf-00 §5.1.21 — array of track names this track depends on */
-    readonly depends?: string[];
+    readonly depends?: readonly (string | number)[];
     /** @see draft-ietf-moq-msf-00 §5.1.22 — temporal layer (0 = base) */
     readonly temporalId?: number;
     /** @see draft-ietf-moq-msf-00 §5.1.23 — spatial layer (0 = base) */
     readonly spatialId?: number;
     /** @see draft-ietf-moq-msf-00 §5.1.16 — target latency in ms; MUST NOT be present if isLive=false */
     readonly targetLatency?: number;
+    /**
+     * Live playback buffer limits in ms (msf-01 §5.2.9). Players SHOULD stabilize
+     * at `target` and SHOULD NOT operate below `min` or above `max`. Ignored when
+     * the track is not live.
+     */
+    readonly buffers?: { readonly min?: number; readonly target?: number; readonly max?: number };
     /** @see draft-ietf-moq-msf-00 §5.1.37 — track duration in ms; MUST NOT be present if isLive=true */
     readonly trackDuration?: number;
     /** @see draft-ietf-moq-msf-00 §5.1.13 — required if packaging="eventtimeline", MUST NOT appear otherwise */
@@ -216,6 +225,16 @@ export interface CatalogTrack {
 
     /** @see draft-ietf-moq-msf-01 §5.2.13 — reference to an initDataList id */
     readonly initRef?: string;
+    /** MSF-02 §5.2.45: trailing accessible window in milliseconds; absent is unspecified. */
+    readonly accessibleWindowTime?: number;
+    /** MSF-02 §5.2.46: positive integral objects per keyframe interval. */
+    readonly keyframeSpacing?: number;
+    /** MSF-02 §5.2.5: recognized packaging parameters; LOC defaults streamMapping to group. */
+    readonly packagingMetadata?: Readonly<Record<string, string>>;
+    /** MSF-02 §5.2.38: signaling only; encrypted playback is unsupported. */
+    readonly encryptionScheme?: string;
+    /** MSF-02 §5.2.42: opaque authorization metadata for the application's provider. */
+    readonly authInfo?: unknown;
     /** @see draft-ietf-moq-msf-01 §5.2.15 — inline media-timeline template */
     readonly template?: MsfMediaTemplate;
     /** @see draft-ietf-moq-cmsf-01 §4.1.2 — content-protection refIDs applying to this track */
@@ -229,6 +248,8 @@ export interface CatalogTrack {
 export interface Catalog {
     /** @see draft-ietf-moq-msf-00 §5.1.1 — Required; normalized to 1 (accepts "1"/"draft-01") */
     readonly version: number;
+    /** MSF-02 rules apply only when declared; absent preserves earlier profiles. */
+    readonly msfDraft?: 'draft-02';
     /** @see draft-ietf-moq-msf-00 §5.1.8 — Required */
     readonly tracks: readonly CatalogTrack[];
     /** @see draft-ietf-moq-msf-00 §5.1.6 — wallclock time in ms since epoch */
@@ -317,6 +338,8 @@ export type CatalogObject = Catalog | CatalogDelta;
  */
 export interface CatalogState {
     readonly version: number;
+    /** MSF-02 rules apply only when declared; absent preserves earlier profiles. */
+    readonly msfDraft?: 'draft-02';
     readonly tracks: CatalogTrack[];
     readonly generatedAt?: number;
     readonly isComplete?: boolean;
@@ -454,3 +477,15 @@ export const SUPPORTED_LOCMAF_VERSIONS: readonly string[] = [LOCMAF_VERSION];
  * @see draft-ietf-moq-msf-00 §5
  */
 export const CATALOG_TRACK_NAME = 'catalog';
+
+/** MSF-02 §5.1.6: ordered operations, including partial updates. */
+export type Msf02DeltaOpKind = Msf01DeltaOpKind | 'update';
+export interface Msf02DeltaOp {
+    readonly op: Msf02DeltaOpKind;
+    readonly tracks: readonly Partial<CatalogTrack>[];
+}
+/** MSF-02 §5.3: generatedAt is required; no independent root fields. */
+export interface Msf02Delta {
+    readonly generatedAt: number;
+    readonly deltaUpdate: readonly Msf02DeltaOp[];
+}

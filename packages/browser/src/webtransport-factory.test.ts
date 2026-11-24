@@ -265,7 +265,7 @@ describe('createWebTransport protocol fallback', () => {
           ? Promise.reject(Object.assign(new Error('refused'), { source: 'session' }))
           : Promise.resolve();
         this.ready.catch(() => {}); // park local copy
-        if (!reject && offered.length > 0) this.protocol = offered[0];
+        if (!reject && offered.length > 0) this.protocol = offered[0]!;
         this.closed = { catch: (_fn: unknown) => { rec.closedCatches++; return Promise.resolve(); } };
       }
     });
@@ -325,4 +325,68 @@ describe('createWebTransport protocol fallback', () => {
       expect(rec.closedCatches).toBeGreaterThan(0);
     }
   });
+});
+
+it('constructs the binding realm WebTransportError, retaining its brand, code and cause', async () => {
+  class RealmWebTransportError extends DOMException {
+    readonly streamErrorCode: number;
+    readonly source: string;
+    constructor(message: string, options: { source: string; streamErrorCode: number }) {
+      super(message, 'WebTransportError');
+      this.streamErrorCode = options.streamErrorCode;
+      this.source = options.source;
+    }
+  }
+  vi.stubGlobal('WebTransportError', RealmWebTransportError);
+  const transport = await createWebTransport()('https://relay.example/moq');
+  const cause = new Error('missing history');
+  const reason = transport.createStreamError!(6, cause);
+  expect(reason).toBeInstanceOf(RealmWebTransportError);
+  expect(reason).toMatchObject({ streamErrorCode: 6, source: 'stream', cause });
+  // This is constructor/realm wiring, not a native browser execution test.
+});
+
+it('refuses coded cancellation construction when the realm has no WebTransportError constructor', async () => {
+  vi.stubGlobal('WebTransportError', undefined);
+  const transport = await createWebTransport()('https://relay.example/moq');
+  expect(() => transport.createStreamError!(6)).toThrow('WebTransportError is unavailable');
+});
+
+it('prefers message/options and preserves browser code0 independently of stream code', async () => {
+  const attempts: unknown[][] = [];
+  class RealmError extends DOMException {
+    readonly source: string;
+    readonly streamErrorCode: number;
+    constructor(message: string, options: { source: string; streamErrorCode: number }) {
+      super(message, 'WebTransportError'); attempts.push([message, options]);
+      this.source = options.source; this.streamErrorCode = options.streamErrorCode;
+    }
+  }
+  vi.stubGlobal('WebTransportError', RealmError);
+  const transport = await createWebTransport()('https://unit.invalid');
+  const cause = new Error('owned cancellation');
+  const reason = transport.createStreamError!(1, cause);
+  expect(reason).toBeInstanceOf(RealmError);
+  expect(reason).toMatchObject({ source: 'stream', streamErrorCode: 1, cause, code: 0 });
+  expect(Object.hasOwn(reason, 'code')).toBe(false);
+  expect(attempts).toHaveLength(1); expect(typeof attempts[0]![0]).toBe('string');
+});
+
+it.each(['wrong-code', 'wrong-source', 'throwing-code', 'unbranded'] as const)('refuses unverified %s from the constructor', async behavior => {
+  const attempts: unknown[] = [];
+  class InvalidError extends DOMException {
+    readonly source = behavior === 'wrong-source' ? 'session' : 'stream';
+    constructor(...args: unknown[]) {
+      super('invalid', 'WebTransportError'); attempts.push(args);
+      if (behavior === 'unbranded') return Object.assign(new DOMException('duck'), { source: 'stream' as const, streamErrorCode: 6 });
+    }
+    get streamErrorCode(): number {
+      if (behavior === 'throwing-code') throw new Error('getter failed');
+      return behavior === 'wrong-code' ? 0 : 6;
+    }
+  }
+  vi.stubGlobal('WebTransportError', InvalidError);
+  const transport = await createWebTransport()('https://unit.invalid');
+  expect(() => transport.createStreamError!(6)).toThrow();
+  expect(attempts).toHaveLength(1);
 });

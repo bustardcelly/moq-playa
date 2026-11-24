@@ -52,27 +52,53 @@ pnpm --filter @moqt/example-node-relay client https://127.0.0.1:4433/moq
 
 ## Run the toy relay/fanout
 
-Relay mode forwards objects from **one publisher** to **many subscribers** over a
+Relay mode forwards objects from **publishers of the same track** to **many subscribers** over a
 registered track set (a toy ABR ladder: `catalog`, `video-1080/720/360`,
 `audio-en/es`, plus the demo track), preserving each object's
 `groupId`/`subgroupId`/`objectId` and raw Object Properties/Extensions, while
-mirroring each graceful subgroup FIN. It
+forwarding subgroup FIN only after complete delivery. It
 supports multiple subscriptions per viewer connection (one alias each), a tiny
-latest-group cache replayed to late joiners, and per-subscription cleanup when a
+latest-group cache available through FETCH, and per-subscription cleanup when a
 viewer unsubscribes one track (ABR switch) without closing the connection.
 
 Namespace registration defaults to the `['demo']` tuple. An embedded relay can
 set `RelayOptions.registeredNamespaces` to accept additional exact tuples;
 namespace fields and track names are compared byte-for-byte.
 
-The relay also answers **FETCH** from the latest-group cache (§9.16 / draft-18
-§10.12): standalone FETCH serves `cache ∩ [start, end)` with proper
-`INVALID_RANGE` / `DOES_NOT_EXIST` rejections, and a **relative joining FETCH**
-resolves its range from the joined subscription's largest cached object — the
-warm-start path a Largest Object subscriber uses to get the current group's
-head immediately. Largest Object subscriptions do **not** get the unconditional
-cache replay (that would violate the filter, §5.1.2); the joining FETCH is the
-way to backfill the current group.
+The relay answers **FETCH** on drafts 18/22, including Joining FETCH on draft 18,
+from bounded history. Without FILL_TIMEOUT, it serves cached Objects in order
+and waits at an in-flight Object for cache admission from any publisher or carrier.
+Completed reception metadata is kept only while a reserved FETCH owns it.
+A completed reception is excluded from new plans but does not wake an accepted
+wait: the SDK may still be holding its delivery. A later subgroup Object delivered by the
+same publication proves that an earlier completed Object was delivered or dropped.
+If that proof leaves the awaited Object unavailable, or its reception is interrupted,
+the relay resets the FETCH with UNKNOWN_OBJECT_STATUS (0x6). There is no relay wait timer.
+
+Embedders must call `relay.setupConnection(conn)` before `conn.connect(...)` so
+Objects that start before PUBLISH still receive delivery-order stamps. Missing or
+late setup is logged and refuses PUBLISH with INTERNAL_ERROR (0x0), Retry Interval 0.
+Datagrams and synthesized END_OF_GROUP status do not provide this proof; such waits settle
+on the next subgroup Object or at publication end.
+
+Requests carrying FILL_TIMEOUT never wait: they are refused before FETCH_OK
+unless every requested Location is retained or proven absent beyond a data-only
+END_OF_GROUP subgroup's FIN. Missing or evicted Objects that are not in flight
+are likewise refused. Fully cached requests with FILL_TIMEOUT remain supported.
+Joining FETCH uses the saved Joining Location, not the head at FETCH time.
+Responses honor group order and cap their endpoint at the current Largest Location.
+Drafts 14/16 return NOT_SUPPORTED for FETCH; live subscriptions continue.
+
+A cancelled request, or one whose requester session closed, keeps one history
+response slot until upstream delivery proof, interruption, or publication end or
+retirement wakes it. It then checks ownership and stops without sending. This accepted
+limitation is bounded by `maxActiveHistoryRequests` (default 32). An SDK
+FETCH-closed notification and Unknown/Timed-Out gap sending (0x10C/0x20C) remain
+follow-ups; gap sending would allow full FILL_TIMEOUT support.
+
+Every SUBSCRIBE delivers only newly received Objects. Arrivals during acceptance
+are queued within the configured object and byte bounds. Overflow ends that
+subscription with TOO_FAR_BEHIND after SUBSCRIBE_OK, leaving the session open.
 
 ```bash
 # standalone relay-mode server (what the publisher example connects to):
@@ -118,22 +144,34 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
   example still runs on one Node event loop; sustained CPU saturation requires more
   capacity or a production relay. The namespace smoke measures a synthetic local
   workload, not browser playback quality or production capacity.
-- **Live, latest-group cache only** — a late joiner gets the most-recent group, not
-  history (no DVR, no init-segment retention policy). FETCH is served from the same
-  single-group cache: ranges reaching further back truncate honestly (gaps in the
-  response indicate objects that no longer exist, §9.16.3). The cache has no
-  configurable byte limit.
+- **Publisher properties** — live delivery and FETCH preserve the header priority,
+  falling back to DEFAULT_PUBLISHER_PRIORITY and then 128. PUBLISH requests with
+  MAX_CACHE_DURATION (including zero), or unavailable initial property metadata,
+  are refused with NOT_SUPPORTED before affecting the track or pending FETCHes.
+- **Bounded in-memory history** — `historyCache` configures positive safe-integer
+  `maxGroups` (default 1), `maxObjects` (256) and `maxBytes` (4 MiB, including
+  properties). The lowest Group is evicted first. First copies are kept, and
+  history survives a publisher's completion or disconnect. Publishers of one
+  track contribute to the same history. `maxActiveHistoryRequests` defaults to 32;
+  excess requests are refused. No upstream gap recovery, DVR or persistence.
+- **Malformed tracks (drafts 18/22)** — conflicting payload, priority or Subgroup duplicates,
+  Objects beyond known subgroup or Group ends, and contradictory Group completion
+  retire the offending publication. Downstream subscriptions and active FETCHes
+  terminate, queued delivery stops, and the track's history is cleared. Sibling
+  tracks continue even if the upstream cancellation fails.
 - **Fixed track registry** — only the names above are routed; a catalog-driven
   registry is a possible follow-up.
 - **Data objects and subgroup header flags** — the incoming `END_OF_GROUP` flag
-  is preserved for live forwarding and cached replay. Graceful FIN is mirrored,
-  so the receiver observes completion and downstream stream credit is returned.
+  is preserved for live forwarding. The current Location window and Forward state
+  are checked at send time, including after stream allocation. FIN is sent only
+  for complete delivery above the initial Start Location. Mid-subgroup joins and
+  later omissions reset only that subgroup with CANCELLED; siblings continue.
   Viewer cancellation drops queued forwarding; the adapter resets unfinished
   streams rather than sending a misleading completion FIN.
   Explicit wire gap/status objects are still not relayed.
 - **Property presence is inferred from the first object in each subgroup** — if
-  properties first appear on a later object, the relay reports and drops that
-  object because the outgoing subgroup header is already fixed. LOC streams that
+  properties first appear on a later object, the relay resets that subgroup
+  because the outgoing header is already fixed. LOC streams that
   carry frame marking on every object do not hit this limitation.
 - **No route authorization, publisher-facing flow-control coordination,
   cross-subscription fairness, reconnect/migration, or persistence.**

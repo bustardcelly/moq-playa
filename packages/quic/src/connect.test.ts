@@ -155,7 +155,7 @@ class FakeSession implements NativeQuicSession {
 
   async close(options = {}): Promise<void> { this.closeCalls.push(options); }
   destroy(error?: unknown, options?: NativeQuicCloseOptions): void {
-    this.destroyCalls.push({ error, options });
+    this.destroyCalls.push({ error, ...(options === undefined ? {} : { options }) });
     this.closedGate.resolve();
   }
 }
@@ -776,4 +776,20 @@ describe('connectQuicWithRuntime', () => {
       });
     },
   );
+});
+
+it('uses its binding-created reason for the actual native reset and STOP_SENDING arguments', async () => {
+  const session = new FakeSession();
+  const fake = fakeRuntime(session);
+  const transport = await connectQuicWithRuntime('moqt://relay.example/moq', {}, fake.runtime);
+  const reason = transport.createStreamError!(6, new Error('missing history'));
+  const outgoing = await transport.createUnidirectionalStream!();
+  await outgoing.getWriter().abort(reason);
+  expect(session.outgoingUni[0]!.resetCodes).toEqual([6n]);
+  const incoming = new FakeStream('uni', [[Uint8Array.of(1)]]);
+  fake.options().onstream(incoming);
+  const readable = (await transport.incomingUnidirectionalStreams.getReader().read()).value!;
+  await readable.cancel(reason);
+  expect(incoming.stopCodes).toEqual([6n]);
+  expect(session.closeCalls).toEqual([]);
 });

@@ -1,6 +1,6 @@
 /** Real MoQT peers and public adapter witnesses; no engine internals or PCM claims. */
 import { MoqtConnection } from '@openmoq/webtransport';
-import { createControlCodec, encodeSubgroupHeader, encodeSubgroupHeader18, encodeSubgroupObject, encodeSubgroupObject18, varint } from '@openmoq/transport';
+import { MessageParam, createControlCodec, encodeSubgroupHeader, encodeSubgroupHeader18, encodeSubgroupObject, encodeSubgroupObject18, varint } from '@openmoq/transport';
 import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import { codecDescriptionFromInit, LocmafEncoder, LocmafGroupState, parseLocmafTrackContext, serializeLocmafObject } from '@openmoq/locmaf';
 import { CmafAssembler } from '../../browser/src/cmaf-assembler.js';
@@ -12,7 +12,7 @@ import type { DecoderCommand } from '@openmoq/playback';
 import { createMediaDiagnostics, type MediaStageObservation } from '../src/media-diagnostics.js';
 import type { AudioDecoderLike, AudioOutputLike, MediaSourceLike, VideoDecoderLike, VideoRendererLike } from '../src/interfaces.js';
 
-export type AudioDraft = 16 | 18 | 22;
+export type AudioDraft = 16 | 18 | 22 | 23;
 export type AudioPath = 'cmaf' | 'loc' | 'locmaf-mse' | 'locmaf-frame';
 export interface AudioRef { readonly name: string; readonly namespace: readonly string[] }
 export const refs = {
@@ -37,6 +37,7 @@ export function audioPeer(draft: AudioDraft) {
   const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
   const requests: Array<AudioRef & { id: bigint }> = [], stopped: bigint[] = [], errors: Error[] = [];
   const control: Array<{ type: string; requestId?: string }> = [];
+  const priorities = new Map<bigint, bigint>();
   const aliases = new Map<string, bigint>(), streams = new Map<string, bigint>();
   const heldResponses: Array<() => void> = [];
   let connected: Promise<void> | undefined;
@@ -45,6 +46,11 @@ export function audioPeer(draft: AudioDraft) {
   };
   server.onSubscribeClosed = id => { stopped.push(id); };
   server.onMessage = message => {
+    if (message.type === 'SUBSCRIBE') {
+      // Omitted SUBSCRIBER_PRIORITY has the protocol default of 128.
+      const priority = message.parameters.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0] ?? 128n;
+      if (typeof priority === 'bigint') priorities.set(message.requestId, priority);
+    }
     control.push({ type: message.type, ...('requestId' in message ? { requestId: String(message.requestId) } : {}) });
     // Legacy drafts cancel through UNSUBSCRIBE, not request-stream closure.
     if (draft === 16 && message.type === 'UNSUBSCRIBE') stopped.push(BigInt(message.requestId));
@@ -56,7 +62,7 @@ export function audioPeer(draft: AudioDraft) {
     return matches[0]!;
   };
   return {
-    client, server, requests, stopped, errors, control, transport: a, request,
+    client, server, requests, stopped, errors, control, priorities, transport: a, request,
     start() {
       connected ??= server.connect(b, draft === 16 ? { maxRequestId: varint(1000) } : {});
       void connected.catch(error => { errors.push(error); });

@@ -68,6 +68,7 @@ export interface AudioChunkMeta {
 }
 
 export interface MediaPublisherOptions {
+  onObject?: (alias: bigint, group: bigint, object: bigint) => void;
   /** Wraps a bigint as the wire integer type (the example passes `varint`). */
   wrapInt: (n: bigint) => unknown;
   /** NEGOTIATED MoQT draft — selects the LOC wire profile and, on draft 18+,
@@ -113,7 +114,7 @@ export interface MediaPublisherOptions {
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
-const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 22];
+const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 22, 23];
 
 /** Validate a queue bound: NaN/Infinity would disable backpressure entirely
  *  and a non-positive or fractional cap has no coherent meaning. */
@@ -176,7 +177,7 @@ export class MediaPublisher {
   /** Every subgroup close ever initiated — drain() waits for all of them. */
   private readonly pendingCloses = new Set<Promise<void>>();
 
-  constructor(connection: MediaPublishConnection, options: MediaPublisherOptions) {
+  constructor(connection: MediaPublishConnection, private readonly options: MediaPublisherOptions) {
     // Validate before any state exists: a NaN/Infinity bound would silently
     // disable backpressure, and an unsupported draft would silently emit
     // draft-16 LOC bytes on a session that negotiated something else.
@@ -486,6 +487,7 @@ export class MediaPublisher {
       };
     }
     try {
+      this.options.onObject?.(alias, this.videoGroupId, this.videoObjectId);
       await this.connection.sendObject(
         this.videoStreamId, this.wrapInt(objectId), data, this.videoExtensions(meta));
     } catch (err) {
@@ -524,6 +526,7 @@ export class MediaPublisher {
       return;
     }
     try {
+      this.options.onObject?.(alias, groupId, 0n);
       await this.connection.sendObject(streamId, this.wrapInt(0n), data, extensions);
     } catch (err) {
       this.trackClose(streamId); // best-effort terminal cleanup for the failed stream

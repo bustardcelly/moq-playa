@@ -13,22 +13,6 @@ must use a new version: versions already published under the old names cannot be
 replaced. `scripts/sync-versions.mjs` updates wrappers along with the canonical
 packages, and the regular release workflow packs and publishes both sets.
 
-## Release Order
-
-1. Choose a new release version, build, test, and review the tarballs.
-2. Bootstrap the canonical packages using the existing migration instructions and
-   configure their npm trusted publishers. Bootstrap packs only `@openmoq/*`.
-3. Publish the compatibility packages through the regular release workflow. Keep
-   trusted publishing configured for the existing names too.
-4. After verifying both sets are installable, explicitly run
-   `bash _migration/step9_deprecate_old_scopes.sh` as an owner of the old packages.
-   This applies npm installation warnings directing users to the replacements;
-   it does not prevent installation. Repeat after subsequent compatibility releases
-   so those new versions also carry the registry deprecation notice.
-
-Publishing and deprecation are separate, explicitly authorized remote actions.
-Do not unpublish existing packages or attach runtime/postinstall warning hooks.
-
 ## Verification
 
 `pnpm smoke:exports` also runs the compatibility smoke test. It packs all packages,

@@ -1,7 +1,7 @@
 /**
  * Toy in-memory relay/fanout for the Node WebTransport MoQT example.
  *
- * One inbound publisher → many subscribers, over a small REGISTERED set of tracks
+ * Inbound publishers → many subscribers, over a small REGISTERED set of tracks
  * (a toy ABR media ladder + the simple demo track). Capabilities:
  *   - track registry (only registered tracks are accepted; others rejected);
  *   - multiple concurrent subscriptions PER viewer connection, one alias each
@@ -9,19 +9,17 @@
  *   - per-subscription teardown via `onSubscribeClosed` — an ABR quality-switch
  *     resets one SUBSCRIBE stream and the relay drops only that subscription,
  *     WITHOUT closing the viewer connection;
- *   - a tiny per-track LIVE cache (the most-recent group) replayed to a late joiner
- *     (except Largest Object subscriptions, which start past the largest object
- *     per §5.1.2 and backfill the current group via a Joining FETCH instead);
- *   - standalone + joining FETCH served from the latest-group cache (§9.16 /
+ *   - SUBSCRIBE forwards only newly received Objects, including arrivals during
+ *     acceptance; retrieve past Objects with FETCH (d18 §10.7);
+ *   - standalone + joining FETCH served from bounded, proven history (§9.16 /
  *     draft-18 §10.12) — see handleFetch;
  *   - forwarding preserves the publisher's groupId/subgroupId/objectId and raw
- *     Object Properties/Extensions, and mirrors graceful subgroup FIN so
+ *     Object Properties/Extensions, and sends FIN only for complete subgroups so
  *     downstream stream credit is returned. The incoming END_OF_GROUP header
  *     bit is preserved before forwarding its first object.
  *
  * Deliberately a TOY — see README:
- *   - LIVE only: the cache holds just the latest group, so a late joiner gets that
- *     group, not full history (no DVR / no real init-segment retention policy).
+ *   - History defaults to one Group, 256 Objects and 4 MiB (no persistence).
  *   - NO route authorization, fairness, reconnect/migration, or persistence.
  *     A bounded per-subscription forwarder sheds a subscriber that cannot keep up.
  *   - Forwards DATA objects and their subgroup header evidence. Explicit wire
@@ -29,26 +27,16 @@
  * All forwarding uses the public MoqtConnection API — no internals.
  */
 import type { MoqtConnection, IncomingPublish } from '@openmoq/webtransport';
-import { MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
+import { decodeTrackProperties18, windowContains, MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
 import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, te, nsStr, hex } from './demo.js';
 import { SubgroupForwarder, type ForwardLimits } from './subgroup-forwarder.js';
-import { isRequestStreamDraft } from '@openmoq/transport';
+import { isDraft22, isDraft23, isRequestStreamDraft, decodeSubscriptionFilter, resolveFillWindow, MAX_VI64 } from '@openmoq/transport';
+import { HistoryCache, type HistoryLimits } from './history-cache.js';
 
 const log = (...a: unknown[]) => console.log('[relay]', ...a);
 
 /** Tracks this relay will route: the simple demo track + the toy media ladder. */
 const REGISTERED_TRACKS = new Set([DEMO_TRACK, ...MEDIA_TRACKS].map((name) => hex(te(name))));
-
-interface CachedObject {
-  readonly firstObject: boolean;
-  readonly endOfGroup: boolean;
-  readonly groupId: bigint;
-  readonly subgroupId: bigint;
-  readonly objectId: bigint;
-  readonly payload: Uint8Array;
-  /** Raw draft-18 Object Properties / draft-14/16 Extensions. */
-  readonly extensions: Uint8Array | undefined;
-}
 
 interface SubscriberSubgroup {
   readonly streamId: bigint;
@@ -63,10 +51,16 @@ interface ForwardObjectFields {
   readonly subgroupId: bigint;
   readonly objectId: bigint;
   readonly payload: Uint8Array;
+  readonly publisherPriority: number;
   readonly extensions: Uint8Array | undefined;
 }
 
 class Subscriber {
+  pending = true;
+  stopped = false;
+  terminalStatus?: bigint;
+  initialStart = { group: 0n, object: 0n };
+  readonly blocked = new Set<string>();
   readonly subgroups = new Map<string, SubscriberSubgroup>();
   readonly forwarder: SubgroupForwarder<ForwardObjectFields>;
 
@@ -75,6 +69,8 @@ class Subscriber {
     readonly requestId: bigint,
     readonly alias: bigint,
     limits: ForwardLimits,
+    readonly retire: () => void,
+    readonly prefix: Map<string, { groupId: bigint; objectId: bigint }>,
   ) {
     this.forwarder = new SubgroupForwarder(limits, {
       forward: (fields) => forwardObject(this, fields),
@@ -82,11 +78,15 @@ class Subscriber {
       reportError: (err) => {
         console.error('[relay] FORWARD SCHEDULER ERROR:', (err as Error).message);
       },
-    });
+    }, false);
   }
 }
 
 export interface RelayOptions {
+  /** Whole-Group retention; defaults to 1 Group, 256 Objects, 4 MiB including properties. */
+  readonly historyCache?: Partial<HistoryLimits>;
+  /** Concurrent pinned FETCH snapshots; defaults to 32. */
+  readonly maxActiveHistoryRequests?: number;
   /** Exact namespace tuples this toy relay accepts. Defaults to DEMO_NAMESPACE. */
   readonly registeredNamespaces?: readonly (readonly string[])[];
   /** Maximum downstream subgroup streams held open by one subscription. */
@@ -103,13 +103,18 @@ const DEFAULT_FORWARD_LIMITS: ForwardLimits = {
   maxPendingBytes: 4 * 1024 * 1024,
 };
 
+interface PendingObject {
+  groupId: bigint; objectId: bigint; source: IncomingPublish;
+  ready: Promise<void>; finish: () => void;
+  ended?: number; owners: number;
+}
 interface Track {
+  largest?: { groupId: bigint; objectId: bigint };
+  sources: Set<IncomingPublish>;
+  upstream: Map<string, { groupId: bigint; objectId: bigint }>;
   subscribers: Subscriber[];
-  /** Latest group seen (for late-join replay), and that group's objects. */
-  cacheGroupId: bigint | null;
-  cache: CachedObject[];
-  /** Subgroups in the cached group whose publisher stream ended gracefully. */
-  cacheClosedSubgroups: Set<string>;
+  cache: HistoryCache;
+  pending: Map<object, PendingObject>;
 }
 
 /** ASCII-safe namespace key that preserves tuple-field boundaries. */
@@ -126,10 +131,25 @@ const trackKeyOf = (namespace: Uint8Array[], trackName: Uint8Array): string =>
 export class Relay {
   private readonly tracks = new Map<string, Track>();
   private nextAlias = 100n;
+  private readonly observed = new WeakSet<MoqtConnection>();
+  private readonly finReceipts = new WeakSet<object>();
+  private readonly finStreams = new WeakMap<object, bigint>();
+  private readonly receptionStreams = new WeakMap<object, bigint | null>();
+  private readonly receptionEnds = new WeakMap<object, number>();
+  private nextReceptionEnd = 0;
+  private readonly historyLimits: HistoryLimits;
+  private readonly maxHistory: number;
+  private readonly historyResponses = new Set<{ conn: MoqtConnection; requestId: bigint; track: Track; malformed: boolean }>();
   private readonly forwardLimits: ForwardLimits;
   private readonly registeredNamespaceKeys: ReadonlySet<string>;
 
   constructor(options: RelayOptions = {}) {
+    this.historyLimits = {
+      maxGroups: positiveInteger('maxGroups', options.historyCache?.maxGroups ?? 1),
+      maxObjects: positiveInteger('maxObjects', options.historyCache?.maxObjects ?? 256),
+      maxBytes: positiveInteger('maxBytes', options.historyCache?.maxBytes ?? 4 * 1024 * 1024),
+    };
+    this.maxHistory = positiveInteger('maxActiveHistoryRequests', options.maxActiveHistoryRequests ?? 32);
     const registeredNamespaces = options.registeredNamespaces ?? [DEMO_NAMESPACE];
     if (registeredNamespaces.length === 0) {
       throw new RangeError('registeredNamespaces must contain at least one namespace');
@@ -157,10 +177,11 @@ export class Relay {
     let track = this.tracks.get(key);
     if (!track) {
       track = {
+        sources: new Set(),
+        upstream: new Map(),
         subscribers: [],
-        cacheGroupId: null,
-        cache: [],
-        cacheClosedSubgroups: new Set(),
+        cache: new HistoryCache(this.historyLimits),
+        pending: new Map(),
       };
       this.tracks.set(key, track);
     }
@@ -172,13 +193,14 @@ export class Relay {
       && REGISTERED_TRACKS.has(hex(trackName));
   }
 
-  /** A subscriber's SUBSCRIBE: accept with a fresh alias, register, replay live cache. */
+  /** Register before acceptance so newly received Objects are queued, never replay history. */
   async handleSubscribe(
     conn: MoqtConnection,
     requestId: bigint,
     namespace: Uint8Array[],
     trackName: Uint8Array,
   ): Promise<void> {
+    conn.setLargestLocationProvider(id => this.currentLargestFor(conn, id));
     try {
       if (!this.isRegisteredTrack(namespace, trackName)) {
         log(`SUBSCRIBE ${nsStr(namespace)}/${td(trackName)} — not registered; rejecting`);
@@ -192,7 +214,7 @@ export class Relay {
       // objects exist — the session SAVES it as the Joining Location, and any
       // Joining FETCH resolves against that exact snapshot (never the head at
       // fetch time, which may have advanced and would gap/overlap delivery).
-      const cachedLargest = latestCached(this.tracks.get(key));
+      const cachedLargest = this.trackHead(this.getTrack(key));
       let acceptParams: Parameters | undefined;
       if (cachedLargest) {
         const value = isRequestStreamDraft(conn.draftVersion)
@@ -205,38 +227,53 @@ export class Relay {
             })();
         acceptParams = new Map([[MessageParam.LARGEST_OBJECT as bigint, [value]]]) as Parameters;
       }
-      await conn.acceptSubscribe(requestId, alias, acceptParams ? { parameters: acceptParams } : undefined);
-
+      this.servedTracks.set(conn.session.getIncomingSubscription(requestId)!, this.getTrack(key));
       const track = this.getTrack(key);
-      const sub = new Subscriber(conn, requestId, alias, this.forwardLimits);
+      const sub = new Subscriber(conn, requestId, alias, this.forwardLimits, () => this.removeSubscription(conn, requestId), new Map(track.upstream));
       track.subscribers.push(sub);
       log(`subscriber joined ${name} (alias=${alias}, requestId=${requestId}); ${track.subscribers.length} now`);
 
-      // Late-join: replay the cached latest group BEFORE any future live object —
-      // but NOT for a Largest Object subscription (§5.1.2: it starts delivery at
-      // {Largest.Group, Largest.Object + 1}; replaying the cached group would
-      // violate the filter). Such a subscriber warm-starts the current group with
-      // a Joining FETCH instead (§10.12.2, see handleFetch).
-      const remoteFilter = conn.session.getIncomingSubscription(requestId)?.remoteFilterType;
-      if (remoteFilter === 'LargestObject') {
-        log(`Largest Object subscription on ${name} — no cache replay (join the group head via Joining FETCH)`);
-      } else if (track.cache.length > 0) {
-        log(`replaying ${track.cache.length} cached object(s) of group ${track.cacheGroupId} to the new ${name} subscriber`);
-        for (const c of track.cache) {
-          this.enqueueObject(track, sub, c);
+      try {
+        await conn.acceptSubscribe(requestId, alias, acceptParams ? { parameters: acceptParams } : undefined);
+        if (sub.stopped || conn.session.getIncomingSubscription(requestId)?.isTerminated !== false) {
+          sub.retire(); return;
         }
-        for (const skey of track.cacheClosedSubgroups) {
-          sub.forwarder.enqueueClose(skey);
-        }
-      }
+        sub.initialStart = conn.session.getIncomingSubscription(requestId)?.locationWindow?.start ?? sub.initialStart;
+        sub.pending = false;
+        if (sub.terminalStatus !== undefined) {
+          sub.retire();
+          if (sub.terminalStatus === 0x12n) await conn.terminateMalformedPublication(requestId);
+          else await conn.publishDone(requestId, varint(sub.terminalStatus), 'acceptance backlog exceeded');
+        } else sub.forwarder.start();
+      } catch (error) { sub.retire(); throw error; }
     } catch (err) {
       console.error('[relay] SUBSCRIBE handling failed:', (err as Error).message);
     }
   }
 
+  /** Call before connect(): the SDK starts all incoming stream readers there. */
+  setupConnection(conn: MoqtConnection): void {
+    if (!this.observed.has(conn) && conn.transportInfo === null) {
+      this.observed.add(conn);
+      conn.observeObjectReception(event => { if (event.type === 'end' && event.origin !== 'datagram') this.receptionEnds.set(event.reception, ++this.nextReceptionEnd); });
+      conn.observeObjectReceipts(event => { if (event.origin === 'group-end') this.finReceipts.add(event.receipt); });
+      const fin = conn.onSubgroupFin; conn.onSubgroupFin = (id, header) => { this.finStreams.set(header, id); fin?.(id, header); };
+    }
+  }
   /** A publisher's PUBLISH: accept and forward its objects to all subscribers. */
   async handlePublish(conn: MoqtConnection, publish: IncomingPublish): Promise<void> {
     try {
+      // PUBLISH refusal/INTERNAL_ERROR/retry 0: d18 §10.6/§10.6.2, Table 18; d22 §1.5/§9.4/§9.4.2/§12.3.
+      if (!this.observed.has(conn)) {
+        await conn.rejectSubscribe(publish.requestId, 0n, 'relay.setupConnection must precede connect'); throw new Error('relay.setupConnection must precede connect');
+      }
+      let properties: IncomingPublish['initialTrackProperties'];
+      try { properties = publish.initialTrackProperties; } catch { /* unavailable provenance */ }
+      for (const container of properties?.get(0x0bn) ?? []) if (container instanceof Uint8Array) properties = new Map([...decodeTrackProperties18(container, 0).properties, ...properties!]);
+      if (!properties || properties.has(0x04n)) {
+        await conn.rejectSubscribe(publish.requestId, 0x3n, 'cache lifetime unsupported or unavailable'); return;
+      }
+      const defaultPriority = Number(properties.get(0x0en)?.[0] ?? 128n);
       if (!this.isRegisteredTrack(publish.trackNamespace, publish.trackName)) {
         log(`PUBLISH ${nsStr(publish.trackNamespace)}/${td(publish.trackName)} — not registered; rejecting`);
         await conn.rejectSubscribe(publish.requestId, RequestError18.DOES_NOT_EXIST, 'unknown track');
@@ -244,140 +281,221 @@ export class Relay {
       }
       const name = td(publish.trackName);
       const key = trackKeyOf(publish.trackNamespace, publish.trackName);
+      const track = this.getTrack(key);
+      track.sources.add(publish);
+      const stop = conn.observeObjectReception(event => {
+        if (event.type === 'progress' || event.trackAlias !== publish.trackAlias) return;
+        this.receptionStreams.set(event.reception, event.streamId);
+        track.cache.attribute(publish, event.groupId, event.subgroupId, event.streamId);
+        if (!track.sources.has(publish) || event.origin !== 'subgroup') return;
+        if (event.type === 'header' && event.objectStatus === null) {
+          let finish!: () => void;
+          const ready = new Promise<void>(resolve => { finish = resolve; });
+          track.pending.set(event.reception, { groupId: event.groupId, objectId: event.objectId, source: publish, ready, finish, owners: 0 });
+        } else if (event.type === 'end') {
+          const pending = track.pending.get(event.reception);
+          if (event.outcome === 'complete' && pending?.owners) pending.ended = this.receptionEnds.get(event.reception)!;
+          else { if (event.outcome === 'interrupted') pending?.finish(); track.pending.delete(event.reception); }
+        }
+      });
+      void publish.closed.then(stop);
+      void publish.closed.then(() => { this.trackHead(track); track.sources.delete(publish); track.cache.forgetSource(publish); this.finishPending(track, publish); });
       await conn.acceptSubscribe(publish.requestId, publish.trackAlias);
       // Create the track on accepted PUBLISH so a publisher that publishes BEFORE any
-      // viewer subscribes still populates the latest-group cache (the normal origin
-      // case) — a late subscriber then gets the cached group via replay.
-      const track = this.getTrack(key);
+      // viewer subscribes still populates the history available to FETCH.
       log(`publisher accepted for ${name} (alias=${publish.trackAlias})`);
 
       publish.onObject = (obj) => {
-        if (obj.kind !== 'data') return; // §see README: gap/status objects are not relayed
-        // Maintain the latest-group cache for late joiners.
-        if (track.cacheGroupId !== obj.groupId) {
-          track.cacheGroupId = obj.groupId;
-          track.cache = [];
-          track.cacheClosedSubgroups.clear();
+        if (!track.sources.has(publish)) return;
+        this.trackHead(track);
+        const receipt = conn.objectReceiptFor(obj);
+        if (receipt && this.finReceipts.has(receipt)) return; // FIN is handled below, never as a wire status.
+        const reception = conn.objectReceptionFor(obj);
+        const ended = reception && this.receptionEnds.get(reception);
+        // SDK publication delivery (including hold replay) follows reception completion order.
+        for (const [token, pending] of track.pending) if (pending.source === publish
+          && pending.ended !== undefined && ended !== undefined && pending.ended < ended) {
+          pending.finish(); track.pending.delete(token);
+        }
+        track.cache.observe(publish, obj, reception && this.receptionStreams.get(reception));
+        if (obj.kind !== 'data') return;
+        if (!track.largest || obj.groupId > track.largest.groupId || (obj.groupId === track.largest.groupId && obj.objectId > track.largest.objectId)) {
+          track.largest = { groupId: obj.groupId, objectId: obj.objectId };
         }
         const extensions = obj.properties ?? obj.extensions;
+        const publisherPriority = obj.publisherPriority ?? defaultPriority;
         const firstObject = obj.isFirstObjectInSubgroup === true;
         const endOfGroup = obj.subgroupContainsEndOfGroup === true;
-        track.cache.push({
+        const added = track.cache.admit({
           firstObject,
           endOfGroup,
           groupId: obj.groupId,
           subgroupId: obj.subgroupId,
           objectId: obj.objectId,
           payload: obj.payload,
+          publisherPriority,
           extensions,
         });
+        if (added === 'malformed') { this.retireMalformed(track, conn, publish); return; }
+        for (const [token, pending] of track.pending) if (pending.groupId === obj.groupId && pending.objectId === obj.objectId) {
+          pending.finish(); track.pending.delete(token);
+        }
+        if (added === 'duplicate') return;
+        track.upstream.set(subgroupKey(obj.groupId, obj.subgroupId), { groupId: obj.groupId, objectId: obj.objectId });
         // Live fanout (identity preserved), ordered per subgroup. Independent
         // subgroup streams may advance concurrently up to the configured bound.
         const { groupId, subgroupId, objectId, payload } = obj;
         for (const sub of [...track.subscribers]) {
           this.enqueueObject(track, sub, {
-            groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup,
+            groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup, publisherPriority,
           });
         }
       };
-      publish.onSubgroupClosed = (header) => {
+      publish.onSubgroupClosed = (header) => queueMicrotask(() => {
         const skey = subgroupKey(header.groupId, header.subgroupId);
-        if (track.cacheGroupId === header.groupId) {
-          track.cacheClosedSubgroups.add(skey);
-        }
+        track.upstream.delete(skey);
+        if (!track.sources.has(publish)) return;
+        if (track.cache.finish(publish, header, this.finStreams.get(header))) { this.retireMalformed(track, conn, publish); return; }
         // onSubgroupClosed follows the final onObject from this incoming stream.
         // Its lane keeps FIN behind that subgroup's final downstream send.
         for (const sub of [...track.subscribers]) {
           sub.forwarder.enqueueClose(skey);
         }
-      };
+      });
     } catch (err) {
       console.error('[relay] PUBLISH handling failed:', (err as Error).message);
     }
   }
 
-  /**
-   * Answer a FETCH from the latest-group live cache (TOY semantics).
-   *
-   * Standalone (§9.16.3): serve `cache ∩ [startLocation, endLocation)` — the
-   * End Location's Object component is one-past ("the end Location, plus 1");
-   * value 0 requests the entire end group. Start beyond the largest cached
-   * object → REQUEST_ERROR INVALID_RANGE. Because only the LATEST group is
-   * retained, a range reaching further back is answered with what exists;
-   * per §9.16.3 gaps in the response stream indicate objects that do not
-   * exist (a real relay would confirm upstream — this toy has no upstream).
-   *
-   * Joining (§9.16.2 / §10.12.2): the session already validated the joining
-   * reference; the range resolves from the subscription's SAVED Joining
-   * Location (the SUBSCRIBE_OK snapshot) and is served identically. No saved
-   * Joining Location → REQUEST_ERROR INVALID_RANGE ("If no Objects have been
-   * published for the track").
-   */
-  async handleFetch(conn: MoqtConnection, requestId: bigint, fetch: Fetch): Promise<void> {
-    try {
-      if (fetch.fetch.fetchType === 0x1) {
-        const sf = fetch.fetch as StandaloneFetch;
-        if (!this.isRegisteredTrack(sf.trackNamespace, sf.trackName)) {
-          log(`FETCH ${nsStr(sf.trackNamespace)}/${td(sf.trackName)} — not registered; rejecting`);
-          await conn.rejectFetch(requestId, RequestError18.DOES_NOT_EXIST as bigint, 'unknown track');
-          return;
-        }
-        const track = this.tracks.get(trackKeyOf(sf.trackNamespace, sf.trackName));
-        const largest = latestCached(track);
-        if (!largest) {
-          await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint, 'no objects published');
-          return;
-        }
-        const start = sf.startLocation;
-        // §9.16.3: "If Start Location is greater than the Largest Object the
-        // publisher MUST return REQUEST_ERROR with error code INVALID_RANGE."
-        if (start.group > largest.groupId
-          || (start.group === largest.groupId && start.object > largest.objectId)) {
-          await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint,
-            `start (${start.group},${start.object}) beyond largest (${largest.groupId},${largest.objectId})`);
-          return;
-        }
-        await serveFetchFromCache(conn, requestId, track!, start, sf.endLocation);
-        return;
-      }
-
-      // Joining (0x2/0x3): locate the joined subscription's track on THIS conn.
-      const joiningReqId = (fetch.fetch as { joiningRequestId: bigint }).joiningRequestId;
-      const track = this.findSubscriptionTrack(conn, joiningReqId);
-      const largest = latestCached(track);
-      if (!track || !largest) {
-        // §9.16.2: no objects published for the track → INVALID_RANGE.
-        await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint, 'no objects published');
-        return;
-      }
-      let range;
-      try {
-        // ONLY the SAVED Joining Location (the SUBSCRIBE_OK snapshot) anchors
-        // the join. A subscription accepted before any object existed has no
-        // Joining Location — the compliant answer is INVALID_RANGE, never a
-        // range derived from the later cache head (it could overlap live
-        // delivery the subscription already carries).
-        range = conn.resolveJoiningFetch(requestId);
-      } catch {
-        // No saved Joining Location, or an absolute joining start beyond the
-        // largest group (§9.16.3).
-        await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint, 'no joining location / start beyond largest');
-        return;
-      }
-      log(`joining FETCH requestId=${requestId} → serving [${range.startLocation.group},${range.startLocation.object}) .. (${range.endLocation.group},${range.endLocation.object})`);
-      await serveFetchFromCache(conn, requestId, track, range.startLocation, range.endLocation);
-    } catch (err) {
-      console.error('[relay] FETCH handling failed:', (err as Error).message);
-      try { await conn.rejectFetch(requestId, RequestError18.INTERNAL_ERROR as bigint, 'relay error'); } catch { /* stream gone */ }
+  private finishPending(track: Track, source?: IncomingPublish): void {
+    for (const [token, pending] of track.pending) if (!source || pending.source === source) {
+      pending.finish(); track.pending.delete(token);
     }
   }
 
-  /** The current cached Largest Location for the track a subscription joined —
-   *  the session's Forward-resume provider (§5.1). Null when nothing cached. */
+  /** d18 §10.12.3 / d22 §3.2, §3.1.4: serve the cached prefix, pause for in-flight Objects. */
+  private readonly servedTracks = new WeakMap<object, Track>();
+  private readonly fetchTracks = new WeakMap<object, Track>();
+
+  async handleFetch(conn: MoqtConnection, requestId: bigint, fetch: Fetch): Promise<void> {
+    conn.setFetchLargestLocationProvider(id => this.currentLargestFor(conn, id));
+    const owner = conn.session.getIncomingFetch(requestId);
+    let owned: PendingObject[] = [];
+    let response: { conn: MoqtConnection; requestId: bigint; track: Track; malformed: boolean } | undefined;
+    try {
+      if (conn.draftVersion <= 16) { await conn.rejectFetch(requestId, 0x3n, 'history FETCH requires draft18 or newer'); return; }
+      let track: Track | undefined, start: { group: bigint; object: bigint }, end: { group: bigint; object: bigint };
+      if (fetch.fetch.fetchType === 0x1) {
+        const sf = fetch.fetch as StandaloneFetch;
+        if (!this.isRegisteredTrack(sf.trackNamespace, sf.trackName)) {
+          await conn.rejectFetch(requestId, RequestError18.DOES_NOT_EXIST, 'unknown track'); return;
+        }
+        track = this.tracks.get(trackKeyOf(sf.trackNamespace, sf.trackName));
+        start = sf.startLocation; end = sf.endLocation;
+      } else {
+        track = this.findSubscriptionTrack(conn, (fetch.fetch as { joiningRequestId: bigint }).joiningRequestId);
+        const range = conn.resolveJoiningFetch(requestId);
+        start = range.startLocation; end = range.endLocation;
+      }
+      const largest = track && this.trackHead(track);
+      if (!track || !largest) throw new Error('no published head');
+      const head = { group: largest.groupId, object: largest.objectId };
+      // Draft 22 and later carry an inclusive End; earlier drafts one past it.
+      if (!isDraft22(conn.draftVersion)) end = { group: end.group, object: end.object === 0n ? MAX_VI64 : end.object - 1n };
+      const filter = fetch.parameters.get(0x21n)?.[0];
+      if (isDraft22(conn.draftVersion) && filter instanceof Uint8Array) {
+        const window = resolveFillWindow(decodeSubscriptionFilter(filter, conn.draftVersion), head);
+        if (!window?.end || window.end.object === undefined) throw new Error('empty relative range');
+        start = window.start; end = { group: window.end.group, object: window.end.object };
+      }
+      if (end.group > head.group || (end.group === head.group && end.object > head.object)) end = head;
+      // d18 §10.2.5 / d22 §9.20.5: without timer/gap support, refuse any timed wait.
+      const rows = track.cache.plan(start, end, fetch.parameters.has(0x0an) ? [] : [...track.pending.values()].filter(row => row.ended === undefined));
+      if (!rows || this.historyResponses.size >= this.maxHistory) throw new Error('history unavailable');
+      if (fetch.parameters.get(0x22n)?.[0] === 2n) rows.sort((a, b) => a.groupId === b.groupId ? 0 : a.groupId > b.groupId ? -1 : 1);
+      this.fetchTracks.set(owner!, track);
+      response = { conn, requestId, track, malformed: false }; this.historyResponses.add(response);
+      owned = rows.filter((row): row is PendingObject => 'ready' in row);
+      for (const row of owned) row.owners++;
+      const endLocation = isDraft22(conn.draftVersion) ? end : { group: end.group, object: end.object === MAX_VI64 ? 0n : end.object + 1n };
+      // draft-23 §3.2: name the Largest Object; the session sends it when it is
+      // inside the requested range. Earlier drafts ignore it.
+      await conn.acceptFetch(requestId, { endLocation, ...(isDraft23(conn.draftVersion) ? { largestObject: head } : {}) });
+      if (response.malformed) { await conn.abortIncomingFetch(requestId, { streamErrorCode: 0x12 }); return; }
+      const sid = await conn.openFetchStream(requestId);
+      for (const row of rows) {
+        if ('ready' in row) await row.ready;
+        // No cancel notification: retain at most maxHistory slots until upstream wakes us.
+        if (response.malformed || conn.session.getIncomingFetch(requestId) !== owner || owner?.isCompleted !== false) return;
+        const location = { group: row.groupId, object: row.objectId };
+        const complete = 'ready' in row ? track.cache.plan(location, location)?.[0] : row;
+        if (!complete) {
+          // Draft 23 §§3.2.2–3, 11.4.2: Unknown preserves the remaining response.
+          if (isDraft23(conn.draftVersion)) {
+            await conn.sendFetchEndOfRange(sid, 'unknown', row.groupId, row.objectId);
+            continue;
+          }
+          // UNKNOWN_OBJECT_STATUS (0x6): d18 §10.12.3/§3.3.3; d22 §3.2.2/§12.5.
+          await conn.abortIncomingFetch(requestId, { streamErrorCode: 6 }); return;
+        }
+        await conn.sendFetchObject(sid, complete);
+        // Draft 23 §3.2.2: mark a known Group ending, including newly admitted tails.
+        if (isDraft23(conn.draftVersion) && track.cache.isFinalObject(row.groupId, row.objectId)) {
+          await conn.sendFetchEndMarker(sid, 'end-of-group');
+        }
+      }
+      await conn.closeFetchStream(sid);
+    } catch (err) {
+      if (!owner || conn.session.state !== 'established' || conn.session.getIncomingFetch(requestId) !== owner) return;
+      if (owner.state === 'transferring') await conn.abortIncomingFetch(requestId, { streamErrorCode: 0 }).catch(error => log('FETCH abort failed', error));
+      else if (conn.session.getIncomingFetch(requestId) === owner) {
+        await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE, String(err)).catch(error => log('FETCH refusal failed', error));
+      }
+    } finally {
+      for (const row of owned) row.owners--;
+      for (const [token, row] of response?.track.pending ?? []) if (row.ended !== undefined && !row.owners) response?.track.pending.delete(token);
+      if (response) this.historyResponses.delete(response);
+    }
+  }
+
+  private retireMalformed(track: Track, conn: MoqtConnection, publish: IncomingPublish): void {
+    if (!isRequestStreamDraft(conn.draftVersion)) return;
+    track.sources.delete(publish); // Fence callbacks even if cancellation cannot be issued.
+    this.finishPending(track);
+    track.cache.clear(); track.upstream.clear(); delete track.largest;
+    for (const sub of [...track.subscribers]) {
+      sub.terminalStatus = 0x12n; sub.forwarder.abort();
+      if (!sub.pending) {
+        sub.retire();
+        void sub.conn.terminateMalformedPublication(sub.requestId).catch(error => console.error('[relay] malformed downstream', error));
+      }
+    }
+    for (const response of this.historyResponses) if (response.track === track) {
+      response.malformed = true;
+      if (response.conn.session.getIncomingFetch(response.requestId)?.responseSent) {
+        void response.conn.abortIncomingFetch(response.requestId, { streamErrorCode: 0x12 }).catch(error => console.error('[relay] malformed FETCH', error));
+      }
+    }
+    void conn.cancelMalformedIncomingPublish(publish).catch(error => console.error('[relay] malformed source', error));
+  }
+
+  /** Current upstream head for an exact live subscription or FETCH; null means known empty. */
   currentLargestFor(conn: MoqtConnection, subRequestId: bigint): { group: bigint; object: bigint } | null {
-    const track = this.findSubscriptionTrack(conn, subRequestId);
-    const largest = latestCached(track);
+    const fetch = conn.session.getIncomingFetch(subRequestId);
+    const owner = conn.session.getIncomingSubscription(subRequestId);
+    const track = fetch ? this.fetchTracks.get(fetch) : owner && !owner.isTerminated ? this.servedTracks.get(owner) : undefined;
+    if (!track) throw new Error('Publication unavailable');
+    const largest = this.trackHead(track);
     return largest ? { group: largest.groupId, object: largest.objectId } : null;
+  }
+
+  private trackHead(track: Track): Track['largest'] {
+    const merge = (head: IncomingPublish['largestLocation'] | undefined) => {
+      if (head && (!track.largest || head.groupId > track.largest.groupId
+          || (head.groupId === track.largest.groupId && head.objectId > track.largest.objectId))) track.largest = { ...head };
+    };
+    for (const source of track.sources) merge(source.largestLocation);
+    return track.largest;
   }
 
   /** Reverse lookup: the track a given (conn, requestId) subscription belongs to. */
@@ -389,10 +507,16 @@ export class Relay {
   }
 
   private enqueueObject(track: Track, sub: Subscriber, fields: ForwardObjectFields): void {
+    if (sub.conn.session.getIncomingSubscription(sub.requestId)?.isTerminated !== false) { sub.retire(); return; }
     const skey = subgroupKey(fields.groupId, fields.subgroupId);
     const retainedBytes = fields.payload.byteLength + (fields.extensions?.byteLength ?? 0);
     const result = sub.forwarder.enqueueObject(skey, fields, retainedBytes);
     if (result.status !== 'overloaded') return;
+    if (sub.pending) {
+      sub.terminalStatus = sub.conn.draftVersion <= 16 ? 0x6n : 0x5n;
+      sub.forwarder.abort();
+      return;
+    }
     const reason = `subscriber requestId=${sub.requestId} cannot keep up: ${result.reason}`;
     log(`${reason}; closing its connection`);
     // A WebTransport connection may own several track subscriptions. Once one
@@ -413,6 +537,7 @@ export class Relay {
       const [sub] = track.subscribers.splice(i, 1);
       // Cancellation is not completion. Stop queued writes; the adapter resets
       // this request's open data streams (§5.1.1), without inventing a FIN.
+      sub!.stopped = true;
       sub!.forwarder.abort();
       log(`subscription requestId=${requestId} unsubscribed; ${track.subscribers.length} subscriber(s) remain on this track`);
       return; // (conn, requestId) is unique to one subscription
@@ -424,58 +549,13 @@ export class Relay {
     for (const track of this.tracks.values()) {
       const removed = track.subscribers.filter((s) => s.conn === conn);
       if (removed.length > 0) {
-        for (const sub of removed) sub.forwarder.abort();
+        for (const sub of removed) { sub.stopped = true; sub.forwarder.abort(); }
         const kept = track.subscribers.filter((s) => s.conn !== conn);
         track.subscribers = kept;
         log(`removed ${removed.length} subscriber(s) on close; ${kept.length} remain on this track`);
       }
     }
   }
-}
-
-/** Largest cached object of a track (cache holds one group, appended in order). */
-function latestCached(track: Track | undefined): CachedObject | undefined {
-  return track && track.cache.length > 0 ? track.cache[track.cache.length - 1] : undefined;
-}
-
-/**
- * Serve `cache ∩ [start, end)` on a FETCH data stream, ascending. `end` is in
- * the wire convention (§9.16.3): Object is one-past; Object 0 requests the
- * entire end group. FETCH_OK's endLocation uses the same encoding and covers
- * exactly what was served (the request end capped at largest, per §10.13).
- */
-async function serveFetchFromCache(
-  conn: MoqtConnection,
-  requestId: bigint,
-  track: Track,
-  start: { group: bigint; object: bigint },
-  end: { group: bigint; object: bigint },
-): Promise<void> {
-  const beforeEnd = (groupId: bigint, objectId: bigint): boolean =>
-    groupId < end.group
-    || (groupId === end.group && (end.object === 0n || objectId < end.object));
-  const atOrAfterStart = (groupId: bigint, objectId: bigint): boolean =>
-    groupId > start.group
-    || (groupId === start.group && objectId >= start.object);
-
-  const servable = track.cache.filter((c) => atOrAfterStart(c.groupId, c.objectId) && beforeEnd(c.groupId, c.objectId));
-  const last = servable[servable.length - 1];
-  const endLocation = last
-    ? { group: last.groupId, object: last.objectId + 1n }
-    : { group: start.group, object: start.object }; // empty range: end == start is legal (§9.16.3)
-
-  await conn.acceptFetch(requestId, { endLocation });
-  const sid = await conn.openFetchStream(requestId);
-  for (const c of servable) {
-    await conn.sendFetchObject(sid, {
-      groupId: c.groupId, subgroupId: c.subgroupId, objectId: c.objectId,
-      publisherPriority: 128, extensions: c.extensions, payload: c.payload,
-    });
-  }
-  // §9.16.3: if no objects exist in the range, the stream carries only the
-  // FETCH_HEADER and closes with FIN.
-  await conn.closeFetchStream(sid);
-  log(`FETCH requestId=${requestId}: served ${servable.length} cached object(s)`);
 }
 
 /** Forward ONE object to one subscriber, preserving identity: reuse (or lazily open) an
@@ -489,13 +569,21 @@ async function forwardObject(
   fields: ForwardObjectFields,
 ): Promise<void> {
   try {
+    if (sub.stopped) return;
+    if (sub.conn.session.getIncomingSubscription(sub.requestId)?.isTerminated !== false) { sub.retire(); return; }
     const { groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup } = fields;
     const skey = subgroupKey(groupId, subgroupId);
+    const owner = sub.conn.session.getIncomingSubscription(sub.requestId)!;
+    if (!owner.isActive || (owner.locationWindow && !windowContains(owner.locationWindow, groupId, objectId))) {
+      if (windowContains({ start: sub.initialStart }, groupId, objectId)) sub.blocked.add(skey);
+      return;
+    }
+    if (sub.blocked.has(skey)) return;
     let subgroup = sub.subgroups.get(skey);
     if (subgroup === undefined) {
       const hasExtensions = extensions !== undefined;
       const streamId = await sub.conn.openSubgroup(sub.alias, groupId, subgroupId, {
-        publisherPriority: 128,
+        publisherPriority: fields.publisherPriority,
         firstObject,
         hasExtensions,
         ...(endOfGroup ? { endOfGroup: true } : {}),
@@ -507,8 +595,16 @@ async function forwardObject(
         `subgroup ${skey} opened without Properties/Extensions, but object ${objectId} carries them`,
       );
     }
-    await sub.conn.sendObject(subgroup.streamId, objectId, payload, extensions);
+    if (owner.isTerminated) { sub.retire(); return; }
+    if (!owner.isActive || (owner.locationWindow && !windowContains(owner.locationWindow, groupId, objectId))) {
+      if (windowContains({ start: sub.initialStart }, groupId, objectId)) sub.blocked.add(skey);
+      return;
+    }
+    if (!sub.stopped) await sub.conn.sendObject(subgroup.streamId, objectId, payload, extensions);
   } catch (err) {
+    const skey = subgroupKey(fields.groupId, fields.subgroupId);
+    sub.blocked.add(skey);
+    await closeSubscriberSubgroup(sub, skey, false);
     console.error('[relay] FORWARD ERROR (object dropped):', (err as Error).message);
   }
 }
@@ -517,12 +613,19 @@ const subgroupKey = (groupId: bigint, subgroupId: bigint): string =>
   `${groupId}/${subgroupId}`;
 
 /** Close one outgoing subgroup after its queued objects have settled. */
-async function closeSubscriberSubgroup(sub: Subscriber, skey: string): Promise<void> {
+async function closeSubscriberSubgroup(sub: Subscriber, skey: string, terminal = true): Promise<void> {
+  if (sub.conn.session.getIncomingSubscription(sub.requestId)?.isTerminated !== false) { sub.retire(); return; }
+  const prefix = sub.prefix.get(skey);
+  const missed = prefix && windowContains({ start: sub.initialStart }, prefix.groupId, prefix.objectId);
+  const incomplete = sub.blocked.has(skey) || missed;
+  if (terminal) { sub.prefix.delete(skey); sub.blocked.delete(skey); }
   const subgroup = sub.subgroups.get(skey);
   if (subgroup === undefined) return;
   sub.subgroups.delete(skey);
   try {
-    await sub.conn.closeSubgroup(subgroup.streamId);
+    // d18 §11.4.3: omitted eligible Objects require RESET, never a completion FIN.
+    if (incomplete) await sub.conn.resetSubgroup(subgroup.streamId);
+    else await sub.conn.closeSubgroup(subgroup.streamId);
   } catch (err) {
     console.error('[relay] SUBGROUP CLOSE ERROR:', (err as Error).message);
   }

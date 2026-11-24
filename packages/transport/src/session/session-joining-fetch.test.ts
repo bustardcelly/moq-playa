@@ -88,6 +88,38 @@ function incomingJoiningFetch(requestId: bigint, joiningRequestId: bigint, fetch
 
 // ─── Outbound (subscriber side) ──────────────────────────────────────
 
+describe.each([14, 16, 18] as const)('draft %i Joining FETCH priority', draft => {
+  it.each([0n, 42n, 255n, undefined])('carries its own priority %s on the wire', priority => {
+    const session = clientSession(draft);
+    const sub = session.subscribe(NS, NAME, { subscriberPriority: varint(7n) });
+    session.handleControlMessage({
+      type: 'SUBSCRIBE_OK', requestId: sub.requestId, trackAlias: varint(42n), parameters: new Map(),
+    });
+    const { actions } = session.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId: sub.requestId, joiningStart: 0n,
+      ...(priority === undefined ? {} : { subscriberPriority: varint(priority) }),
+    });
+    const msg = (actions[0] as SendControlAction).message as Fetch;
+    const codec = createControlCodec(draft);
+    const decoded = codec.decode(codec.encode(msg), 0).message as Fetch;
+    expect(decoded.type).toBe('FETCH');
+    // d14 §9.16 has a mandatory byte; d16 §9.2.2.3 / d18 §10.2.7 default to 128 when absent.
+    expect(decoded.parameters.get(MessageParam.SUBSCRIBER_PRIORITY))
+      .toEqual(priority === undefined ? (draft === 14 ? [128n] : undefined) : [priority]);
+    expect(msg.parameters.get(MessageParam.SUBSCRIBER_PRIORITY))
+      .toEqual(priority === undefined ? undefined : [priority]);
+  });
+
+  it('rejects priority above 255 with the subscription priority range', () => {
+    const session = clientSession(draft);
+    const joiningRequestId = establishOutboundSubscription(session);
+    expect(() => session.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId, joiningStart: 0n,
+      subscriberPriority: varint(256n),
+    })).toThrow('SUBSCRIBER_PRIORITY must be 0-255');
+  });
+});
+
 describe('session.joiningFetch (outbound)', () => {
   let session: Session;
 
@@ -355,6 +387,12 @@ describe('REQUEST_UPDATE filter changes drive the joining gate (§9.2.2.5)', () 
       [encodeSubscriptionFilter({ type: 'NextGroupStart' }, 16)]]]);
     session.handleControlMessage(incomingSubscribe(0n, params));
     session.acceptSubscribe(0n, 9n);
+    const sourceOwner = session.getIncomingSubscription(0n)!;
+    // This filter-gate fixture publishes no Objects; only this exact owner is empty.
+    session.setLargestLocationProvider(id => {
+      if (id !== 0n || session.getIncomingSubscription(id) !== sourceOwner || sourceOwner.isTerminated) throw new Error('Unavailable source');
+      return null;
+    });
 
     updateFilter(session, 0n, 2n, { type: 'LargestObject' });
 
@@ -369,6 +407,12 @@ describe('REQUEST_UPDATE filter changes drive the joining gate (§9.2.2.5)', () 
       [encodeSubscriptionFilter({ type: 'LargestObject' }, 16)]]]);
     session.handleControlMessage(incomingSubscribe(0n, params));
     session.acceptSubscribe(0n, 9n);
+    const sourceOwner = session.getIncomingSubscription(0n)!;
+    // This filter-gate fixture publishes no Objects; only this exact owner is empty.
+    session.setLargestLocationProvider(id => {
+      if (id !== 0n || session.getIncomingSubscription(id) !== sourceOwner || sourceOwner.isTerminated) throw new Error('Unavailable source');
+      return null;
+    });
 
     updateFilter(session, 0n, 2n, { type: 'AbsoluteStart', startGroup: 5n, startObject: 0n });
 
@@ -384,6 +428,12 @@ describe('REQUEST_UPDATE filter changes drive the joining gate (§9.2.2.5)', () 
       [encodeSubscriptionFilter({ type: 'LargestObject' }, 16)]]]);
     session.handleControlMessage(incomingSubscribe(0n, params));
     session.acceptSubscribe(0n, 9n);
+    const sourceOwner = session.getIncomingSubscription(0n)!;
+    // This filter-gate fixture publishes no Objects; only this exact owner is empty.
+    session.setLargestLocationProvider(id => {
+      if (id !== 0n || session.getIncomingSubscription(id) !== sourceOwner || sourceOwner.isTerminated) throw new Error('Unavailable source');
+      return null;
+    });
 
     session.handleControlMessage({
       type: 'REQUEST_UPDATE', requestId: varint(2n),

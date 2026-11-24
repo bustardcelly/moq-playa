@@ -20,6 +20,7 @@ import {
   filterInitSegment,
   describeBoxes,
   peekSegmentMetadata,
+  readMdhdTimescale,
   readSegmentTimeRanges,
   readTrexDefaults,
   type SegmentTimeRange,
@@ -41,6 +42,7 @@ interface AppendEntry {
 interface TrackTimeline {
   readonly trackName: string;
   readonly index: TimelineIndex;
+  refused?: TimelineIndex;
 }
 type NativeRanges = Array<[number, number]>;
 /** See MediaSwitchRecovery. Times are seconds on the media element timeline, read from the native video SourceBuffer. */
@@ -280,7 +282,7 @@ export interface MseMediaSourceOptions {
    *  receiving-stream evidence can extend it to at least 2s (never beyond
    *  max(this value, 2s)). Zero preserves immediate append scheduling. */
   readonly reorderWindowMs?: number;
-  /** Retained append-queue limits, per media type. Defaults 100 chunks / 8 MiB. */
+  /** Retained append-queue limits, per media type. Defaults 1,000 chunks / 8 MiB. */
   readonly maxQueuedChunks?: number;
   readonly maxQueuedBytes?: number;
   /** DRM configuration. When set, EME is initialized and license requests
@@ -497,6 +499,12 @@ function safeBuffered(buffer: SourceBuffer): TimeRanges | null {
  * live-buffer hygiene: back-buffer eviction, a behind-live cap, and
  * QuotaExceededError recovery (evict + retry, escalating to flush-and-rejoin).
  *
+ * The adapter owns the element: it clears autoplay when it takes the element and
+ * restores the original value on destroy. Playback started by anything else
+ * before startup completes is paused, and the adapter's startup then starts playback
+ * once its conditions hold. Embedders resume through resumePlayback()
+ * rather than video.play(), including recovery from an unexpected pause.
+ *
  * @see draft-ietf-moq-cmsf-00 §3 (CMAF Packaging)
  */
 export class MseMediaSource implements MediaSourceLike {
@@ -529,6 +537,8 @@ export class MseMediaSource implements MediaSourceLike {
    * never calls setPlaybackIntent keeps the previous behavior.
    */
   private playbackIntent = true;
+  private readonly originalAutoplay: boolean;
+  private pendingElementPlays = 0;
 
   /**
    * Declare (or withdraw) playback intent. Withdrawing cancels an in-flight
@@ -817,7 +827,7 @@ export class MseMediaSource implements MediaSourceLike {
   private wedgeSeekTarget: number | null = null;
 
   // ── Buffered-hole gap-jump state (fully separate from wedge state) ──
-  /** Holes wider than this are never jumped (escalate instead). */
+  /** Holes wider than this require owned recovery (otherwise escalate). */
   private static readonly GAP_JUMP_MAX_HOLE_SEC = 2.0;
   /** Minimum spacing between jumps (swiss-cheese streams keep jumping, bounded). */
   private static readonly GAP_JUMP_MIN_INTERVAL_MS = 5_000;
@@ -836,6 +846,7 @@ export class MseMediaSource implements MediaSourceLike {
   private gapCandidate: {
     curEnd: number; nextStart: number; armedAtMs: number; kind: 'combined' | 'video';
     wideWarned: boolean; spent: boolean;
+    floors: ReadonlyMap<string, bigint>;
   } | null = null;
   /** Own last-observed playhead — never reads or writes wedgeLastTime. */
   private gapLastPlayheadTime: number | null = null;
@@ -913,6 +924,7 @@ export class MseMediaSource implements MediaSourceLike {
   /** Orders append submissions; distinct from the diagnostic ring's counter. */
   private submitSeq = 0;
   private switchRecovery: SwitchRecoveryState | null = null;
+  private recoverableGapError: Error | null = null;
   /** Generation of the current SourceBuffer set; bumped on reset/destroy. */
   private bufferGen = 0;
   /** Ownership lasts through updateend, including the updating=false interval. */
@@ -927,6 +939,8 @@ export class MseMediaSource implements MediaSourceLike {
   /** trex defaults from the init segment, per media type. */
   private videoTrex: TrexDefaults | undefined;
   private audioTrex: TrexDefaults | undefined;
+  /** mdhd timescale from the same init, or null when it declares none. */
+  private readonly timescale: { video: number | null; audio: number | null } = { video: null, audio: null };
   /** MIME selected at SourceBuffer creation or by the last successful retype. */
   private readonly bufferMime: { video: string | null; audio: string | null } =
     { video: null, audio: null };
@@ -988,7 +1002,7 @@ export class MseMediaSource implements MediaSourceLike {
     };
     this.reorderWindowMs = boundedInteger('reorderWindowMs', options.reorderWindowMs ?? 250, 0);
     if (this.reorderWindowMs > 0x7fffffff) throw new Error('reorderWindowMs exceeds the timer range');
-    this.maxQueuedChunks = boundedInteger('maxQueuedChunks', options.maxQueuedChunks ?? 100, 1);
+    this.maxQueuedChunks = boundedInteger('maxQueuedChunks', options.maxQueuedChunks ?? 1000, 1);
     this.maxQueuedBytes = boundedInteger('maxQueuedBytes', options.maxQueuedBytes ?? 8 * 1024 * 1024, 1);
     this.keepBehindSec = options.keepBehindSec ?? 10;
     this.maxAheadSec = options.maxAheadSec ?? 15;
@@ -1051,6 +1065,8 @@ export class MseMediaSource implements MediaSourceLike {
       this.objectUrl = URL.createObjectURL(this.ms);
       this.video.src = this.objectUrl;
     }
+    this.originalAutoplay = this.video.autoplay;
+    this.video.autoplay = false;
     this.video.addEventListener('playing', this.handlePlaying);
     this.video.addEventListener('waiting', this.handleWaiting);
     this.video.addEventListener('seeking', this.handleWatchdogSeek);
@@ -1456,6 +1472,7 @@ export class MseMediaSource implements MediaSourceLike {
             const trexMap = readTrexDefaults(videoInit);
             const first = trexMap.values().next();
             if (!first.done) this.videoTrex = first.value;
+            this.timescale.video = readMdhdTimescale(videoInit);
             const vb = this.videoBuffer;
             this.runMutation('video', 'init-append', () => vb.appendBuffer(videoInit.buffer as ArrayBuffer));
           }
@@ -1478,6 +1495,7 @@ export class MseMediaSource implements MediaSourceLike {
             const trexMap = readTrexDefaults(audioInit);
             const first = trexMap.values().next();
             if (!first.done) this.audioTrex = first.value;
+            this.timescale.audio = readMdhdTimescale(audioInit);
             const ab = this.audioBuffer;
             this.runMutation('audio', 'init-append', () => ab.appendBuffer(audioInit.buffer as ArrayBuffer));
           }
@@ -1564,12 +1582,43 @@ export class MseMediaSource implements MediaSourceLike {
     if (wait?.timer !== null && wait?.timer !== undefined) clearTimeout(wait.timer);
   }
 
+  private pruneRefused(timeline: TrackTimeline): void {
+    if (!timeline.refused) return;
+    const end = timeline.index.extent?.end;
+    // Keep the latest exact spans; forgetting evidence restores the ordinary wait.
+    const kept = timeline.refused.getRanges().filter(r => end === undefined || r.end > end).slice(-32);
+    timeline.refused.clear();
+    for (const range of kept) timeline.refused.insert(range.start, range.end);
+  }
+
   private enqueueAppend(mediaType: 'video' | 'audio', entry: AppendEntry): boolean {
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
     const bytes = queue.reduce((total, queued) => total + queued.data.byteLength, 0);
     if (queue.length >= this.maxQueuedChunks || entry.data.byteLength > this.maxQueuedBytes - bytes) {
+      const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
+      const ranges = this.scoreAppend(mediaType, entry);
+      if (ranges?.length) {
+        let timeline = timelines.get(entry.trackIdentity);
+        if (!timeline) {
+          timeline = { trackName: entry.trackName, index: new TimelineIndex() };
+          timelines.set(entry.trackIdentity, timeline);
+        }
+        // Exact coverage only: never excuse media that was not offered.
+        for (const range of ranges) if (range.sampleCount > 0) {
+          (timeline.refused ??= new TimelineIndex()).insert(range.startTime, range.endTime);
+          this.pruneRefused(timeline);
+        }
+      }
+      const bound = queue.length >= this.maxQueuedChunks ? 'maxQueuedChunks' : 'maxQueuedBytes';
+      const key = `${mediaType}:capacity:${entry.trackIdentity}`;
+      const message = `[MSE] ${mediaType} track "${entry.trackName}" append queue capacity reached (${bound})`;
+      if (!this.seenDiagnostics.has(key)) {
+        this.seenDiagnostics.add(key);
+        console.warn(message);
+      } else {
+        this.diag(message);
+      }
       this.appendOutcome(entry.token, 'discarded', 'queue capacity');
-      this.logWarn('[MSE] %s append queue capacity reached', mediaType);
       return false;
     }
     // Retaining a small view must not retain or append its larger backing pool.
@@ -1609,16 +1658,31 @@ export class MseMediaSource implements MediaSourceLike {
     return chosen;
   }
 
+  // Receiver policy beyond CMAF contiguity (LOCMAF-01 §12.2): tolerate up to
+  // 1 ms, never a larger gap. Unknown timescales stay exact.
+  private contiguousSlack(mediaType: 'video' | 'audio'): bigint {
+    const timescale = this.timescale[mediaType];
+    return timescale === null ? 0n : BigInt(timescale) / 1000n;
+  }
+
   private holdAppendGap(mediaType: 'video' | 'audio', entry: AppendEntry): boolean {
     const generation = this.bufferGen;
     delete entry.skipsGap;
     if (this.reorderWindowMs === 0) return false;
     const ranges = this.scoreAppend(mediaType, entry);
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
-    const end = timelines.get(entry.trackIdentity)?.index.extent?.end;
+    const timeline = timelines.get(entry.trackIdentity);
+    const end = timeline?.index.extent?.end;
     // The first segment anchors the clock. Unknown layouts retain the existing
     // fail-open policy; tick values are compared only within this track/context.
     if (!ranges?.length || end === undefined || ranges[0]!.startTime <= end) return false;
+    const media = ranges.filter(r => r.sampleCount > 0 && r.endTime > r.startTime);
+    const gaps = media.reduce((sum, r, i) => { const gap = r.startTime - (media[i - 1]?.endTime ?? end); return sum + (gap > 0n ? gap : 0n); }, 0n);
+    if (media.length && gaps <= this.contiguousSlack(mediaType)) return false;
+    if (media.length && timeline?.refused && media.every((range, i) => {
+      const from = media[i - 1]?.endTime ?? end;
+      return range.startTime <= from || timeline.refused!.containsRange(from, range.startTime);
+    })) { entry.skipsGap = true; return false; }
     const previous = this.appendGapWait[mediaType];
     const now = performance.now();
     entry.waitStartedAt ??= now;
@@ -1629,7 +1693,8 @@ export class MseMediaSource implements MediaSourceLike {
     // Same-group accepted transforms may complete out of order. FIN releases only
     // that stream, after its accepted async work. Without such evidence use
     // the ordinary 250ms policy, including fully received sparse groups.
-    const receiving = entry.groupId !== undefined && this.currentReceivingGroups(mediaType)
+    // Audio receiving evidence gates hole recovery only, not ordinary append timing.
+    const receiving = mediaType === 'video' && entry.groupId !== undefined && this.currentReceivingGroups(mediaType)
       .some(group => group.trackIdentity === entry.trackIdentity && group.groupId <= entry.groupId!);
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
     if (this.destroyed || generation !== this.bufferGen || !queue.includes(entry) || this.changingType[mediaType]) return true;
@@ -1863,7 +1928,20 @@ export class MseMediaSource implements MediaSourceLike {
 
     this.changingType[mediaType] = true;
     this.clearReceivingGroups(mediaType);
-    this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
+    // A retype keeps the coded frames already buffered, so a narrow video
+    // hole the playhead was seen to cross is still there; hasPostHoleCoverage
+    // revalidates it against the native ranges before any recovery. Keeping
+    // it lets the watchdog recover a playhead frozen just past a switch hole
+    // when the next switch changes codec profile (as consecutive downshifts
+    // across an H.264 profile boundary do). A wide-hole witness, which can
+    // authorize skipping media, still retires. With no hole yet, the covered
+    // position also survives: a switch commit can retype after the playhead
+    // has run past the old video but before the new rendition's first range
+    // lands, and that position is what later anchors the hole. Its generation
+    // and buffer identity are revalidated whenever it is used.
+    const hole = this.wedgeVideoHole;
+    if (hole !== null && hole.start - hole.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC) this.clearVideoHoleEvidence();
+    this.handleWatchdogSeeked();
     this.endRequested = false;
     try {
       const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
@@ -1902,6 +1980,7 @@ export class MseMediaSource implements MediaSourceLike {
       const trex = Array.from(trexMap.values())[0];
       if (mediaType === 'video') this.videoTrex = trex;
       else this.audioTrex = trex;
+      this.timescale[mediaType] = readMdhdTimescale(filtered);
 
       // Refresh init summary so failure dumps reflect the current codec.
       const boxes = describeBoxes(filtered);
@@ -2033,6 +2112,53 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { return null; }
   }
 
+  private liveStartupCushionUs: number | null = null;
+  // 0: nothing successfully appended; -1: appended, but duration unavailable.
+  private readonly startupObjectSec = { video: 0, audio: 0 };
+  setLiveStartupCushion(cushionUs: number | null): void {
+    this.liveStartupCushionUs = cushionUs;
+  }
+
+  private startupBufferedAt(position: number): boolean {
+    if (this.liveStartupCushionUs === null) return true;
+    if ((this.videoBuffer && this.startupObjectSec.video === 0)
+      || (this.audioBuffer && this.startupObjectSec.audio === 0)) return false;
+    if ((this.videoBuffer && this.startupObjectSec.video < 0)
+      || (this.audioBuffer && this.startupObjectSec.audio < 0)) return true;
+    const required = Math.max(this.startupObjectSec.video, this.startupObjectSec.audio)
+      + this.liveStartupCushionUs / 1_000_000;
+    const ranges = this.video.buffered;
+    for (let i = 0; i < ranges.length; i++) {
+      if (ranges.start(i) > position || position >= ranges.end(i)) continue;
+      return (['video', 'audio'] as const).every(role => {
+        const buffer = role === 'video' ? this.videoBuffer : this.audioBuffer, scale = this.timescale[role];
+        if (!buffer || !scale) return true;
+        let start = position;
+        // Native ranges may omit the first presented frame. At the run's start,
+        // count that first Object's appended media; never count a preceding hole.
+        if (position === ranges.start(i)) {
+          const timelines = role === 'video' ? this.videoTimelines : this.audioTimelines;
+          for (const { index } of timelines.values()) for (const range of index.getRanges()) {
+            const origin = Number(range.start) / scale + buffer.timestampOffset;
+            if (origin <= position && position < Number(range.end) / scale + buffer.timestampOffset
+              && position < origin + this.startupObjectSec[role]) start = Math.min(start, origin);
+          }
+        }
+        return ranges.end(i) - start + Number(this.contiguousSlack(role)) / scale >= required;
+      });
+    }
+    return false;
+  }
+
+  private originalPitch: boolean | undefined;
+  /** Change the shared element rate while preserving audio pitch. */
+  setPlaybackRate(rate: number): void {
+    if (rate !== 1) this.originalPitch ??= this.video.preservesPitch;
+    this.video.preservesPitch = rate === 1 ? this.originalPitch ?? this.video.preservesPitch : true;
+    if (rate === 1) this.originalPitch = undefined;
+    this.video.playbackRate = rate;
+  }
+
   getBufferAheadUs(): number | null {
     const v = this.video;
     if (!v.buffered.length) {
@@ -2103,6 +2229,7 @@ export class MseMediaSource implements MediaSourceLike {
     // Cancel any in-flight startup FIRST: a late seeked/play from the
     // superseded generation must not resurrect playback against new buffers.
     this.cancelStartup();
+    this.startupObjectSec.video = this.startupObjectSec.audio = 0;
     if (this.sourceOpenListener) {
       this.ms.removeEventListener('sourceopen', this.sourceOpenListener);
       this.sourceOpenListener = null;
@@ -2158,6 +2285,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.changingType.audio = false;
     this.videoTrex = undefined;
     this.audioTrex = undefined;
+    this.timescale.video = this.timescale.audio = null;
     this.seenDiagnostics.clear();
     this.quotaRetried.video = false;
     this.quotaRetried.audio = false;
@@ -2206,6 +2334,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.removeAttribute('src');
     (this.video as any).srcObject = null;
     this.video.load();
+    this.video.autoplay = this.originalAutoplay;
     this.onFirstFrame = null;
     this.onAttached = null;
     this.onError = null;
@@ -2698,6 +2827,8 @@ export class MseMediaSource implements MediaSourceLike {
       const needsSeek = this.video.currentTime < start
         || this.video.currentTime >= start + duration;
 
+      if (!this.startupBufferedAt(needsSeek ? start : this.video.currentTime)) return;
+
       // INVARIANT: never play while the element is still seeking.
       //
       // Assigning `currentTime` updates it SYNCHRONOUSLY even though the seek
@@ -2881,7 +3012,13 @@ export class MseMediaSource implements MediaSourceLike {
    */
   private async playElement(generation: number): Promise<boolean> {
     const source = this.ms;
-    await this.video.play();
+    // Positioning or an autoplay rejection may have outlasted buffered media.
+    if (!this.playTriggered && !this.startupBufferedAt(this.video.currentTime)) {
+      this.startupPhase = 'idle'; return false;
+    }
+    this.pendingElementPlays++;
+    try { await this.video.play(); }
+    finally { this.pendingElementPlays--; }
     if (this.startupLive(generation)) return true;
     // Withdrawn/destroyed while the promise was pending: the element started
     // anyway. Undo it — this is the late-playback hole a generation check alone
@@ -2947,9 +3084,9 @@ export class MseMediaSource implements MediaSourceLike {
     this.wedgeTimer = setInterval(
       () => {
         const nowMs = performance.now();
-        // Gap-jump first: the wedge detector structurally ignores the
-        // at-a-hole case (aheadSec is computed only within the containing
-        // range), so the two never race for the same playhead state.
+        // Gap-jump first: the wedge detector excludes the gap-jump edge
+        // window inside the containing range, so the two never race for
+        // the same playhead state.
         this.checkGapJump(nowMs);
         this.checkPlayheadWedge(nowMs);
       },
@@ -3067,6 +3204,13 @@ export class MseMediaSource implements MediaSourceLike {
       || (this.nativeRanges(this.audioBuffer)?.some(([start, end]) => start <= nextStart + tol && end > nextStart) ?? false);
   }
 
+  /** See {@link MediaSourceLike.tryRecoverBufferedGap}. */
+  tryRecoverBufferedGap(error: Error): boolean {
+    if (error !== this.recoverableGapError || this.recoverableGapError === null) return false;
+    this.recoverableGapError = null; // One synchronous attempt for this exact escalation.
+    return this.checkGapJump(performance.now(), true) === true;
+  }
+
   /** Drop the armed hole candidate (wait restarts on the next sighting). */
   private disarmGap(): void {
     this.gapCandidate = null;
@@ -3095,7 +3239,7 @@ export class MseMediaSource implements MediaSourceLike {
 
   /**
    * Detect a playhead frozen at a buffered hole and, after a bounded wait,
-   * seek just past it. Holes wider than GAP_JUMP_MAX_HOLE_SEC never jump;
+   * seek just past it. Wider holes require switch recovery or player permission;
    * if one persists GAP_WIDE_HOLE_FATAL_MS it escalates exactly once via
    * onError with name 'MediaGapUnrecoverableError' (the same name-based
    * fatal channel as the wedge ladder's final rung — the app rebuilds).
@@ -3104,7 +3248,7 @@ export class MseMediaSource implements MediaSourceLike {
    * any callback runs, so throwing or re-entrant listeners cannot skip the
    * seek, double-jump, or re-emit the escalation.
    */
-  private checkGapJump(nowMs: number): void {
+  private checkGapJump(nowMs: number, recovery = false): boolean | void {
     const generation = this.bufferGen;
     // Landing cancellation FIRST — before the episode fallback can transfer
     // any landing-owned evidence. Pause / element-error / withdrawn intent
@@ -3177,10 +3321,10 @@ export class MseMediaSource implements MediaSourceLike {
 
     // Accepted native work can still fill the hole. Neither buffered ranges
     // nor elapsed wall time authorizes skipping that work, including finite EOS.
-    if (this.hasPendingNativeWork()) {
-      this.disarmGap();
-      return;
-    }
+    // It holds this check without restarting the wait: live media appends
+    // many times a second, so a check often finds an append in flight. If
+    // that work fills or moves the hole, the next idle check sees it.
+    if (this.hasPendingNativeWork()) return;
     const ct = v.currentTime;
     if (this.switchRecovery?.state === 'armed' && ct > this.switchRecovery.boundStart) this.switchRecovery = null;
     const quality = this.getVideoPlaybackQuality();
@@ -3221,8 +3365,9 @@ export class MseMediaSource implements MediaSourceLike {
     // video-only exception below also checks both native SourceBuffers.
     const tol = MseMediaSource.GAP_IDENTITY_TOLERANCE_SEC;
     let kind: 'combined' | 'video' = 'combined';
-    // Recognize only the immediately crossed BOTH-track gap. This is a
-    // bounded library policy, independent of the wider switch exception.
+    // Recognize only the immediately crossed combined gap. Its width is
+    // judged below exactly as at an edge: a narrow one is jumped after the
+    // wait; a wide one is warned about and escalated, never skipped here.
     const source = this.ms, videoBuffer = this.videoBuffer, audioBuffer = this.audioBuffer;
     const readCrossedGap = () => {
       try {
@@ -3238,16 +3383,29 @@ export class MseMediaSource implements MediaSourceLike {
           }
           return null;
         };
+        // Each SourceBuffer must hold the combined gap's edge in one range and
+        // the landing in the very next one. A track whose range runs past the
+        // playhead (video buffered beyond an audio-only shortfall) qualifies:
+        // the element cannot play there either.
+        const bracket = (ranges: TimeRanges, edge: number, landing: number) => {
+          for (let i = 0; i + 1 < ranges.length; i++) {
+            const begin = ranges.start(i), end = ranges.end(i);
+            const start = ranges.start(i + 1), tail = ranges.end(i + 1);
+            if (![begin, end, start, tail].every(Number.isFinite)
+                || begin >= end || start >= tail) return null;
+            if (begin <= edge && edge <= end && start <= landing && landing < tail) return { begin, end, start, tail };
+          }
+          return null;
+        };
         const combined = adjacent(v.buffered);
         if (!combined || !Number.isFinite(ct)
             || ct - combined.end >= MseMediaSource.GAP_EDGE_WINDOW_SEC
-            || combined.start - combined.end <= tol
-            || combined.start - combined.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9) return null;
+            || combined.start - combined.end <= tol) return null;
         const landing = combined.start + Math.min(0.01, (combined.tail - combined.start) / 2);
         const duration = v.duration;
         if (!Number.isFinite(landing) || landing <= combined.start || landing >= combined.tail
             || !(duration === Infinity || Number.isFinite(duration) && landing < duration)) return null;
-        const vr = adjacent(videoBuffer.buffered), ar = adjacent(audioBuffer.buffered);
+        const vr = bracket(videoBuffer.buffered, combined.end, landing), ar = bracket(audioBuffer.buffered, combined.end, landing);
         if (!vr || !ar || [vr, ar].some(r => r.begin > combined.end || r.end < combined.end
             || r.start >= landing || r.tail <= landing)
             || Math.abs(Math.max(vr.start, ar.start) - combined.start) > tol
@@ -3309,17 +3467,34 @@ export class MseMediaSource implements MediaSourceLike {
     if (c === null || c.kind !== kind || Math.abs(c.curEnd - curEnd!) > tol || Math.abs(c.nextStart - nextStart!) > tol) {
       this.gapCandidate = {
         curEnd: curEnd!, nextStart: nextStart!, armedAtMs: nowMs, kind,
-        wideWarned: false, spent: false,
+        wideWarned: false, spent: false, floors: new Map(this.committedGroupFloor),
       };
       return;
     }
-    if (c.spent) return;
+    if (c.spent && !recovery) return;
 
     // Unjumpable width: warn once; escalate once if it persists.
     // Strictly the advertised bound; 1e-9 guards float subtraction noise
     // only — the 10ms identity tolerance must never widen the policy.
     const wide = holeSec > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9;
-    if (wide && !this.switchRecoveryCovers(curEnd!, nextStart!)) {
+    if (recovery) {
+      const receiving = (['video', 'audio'] as const).some(role => this.currentReceivingGroups(role).some(group => {
+        const floor = c.floors.get(`${role}:${group.trackIdentity}`);
+        return floor === undefined || group.groupId <= floor;
+      }));
+      const landing = nextStart! + Math.min(0.01, ((nextEnd ?? nextStart!) - nextStart!) / 2);
+      const covered = [this.videoBuffer, ...(this.audioBuffer ? [this.audioBuffer] : [])].every(buffer =>
+        this.nativeRanges(buffer)?.some(([start, end]) => start <= landing && landing < end));
+      // A reservation vetoes recovery only for a gap it could authorize; a
+      // crossed gap never borrows it, so it cannot hold that gap's recovery.
+      if (receiving || !covered || (this.switchRecovery && !crossed) || this.hasPendingNativeWork()
+          || this.destroyed || generation !== this.bufferGen || this.gapCandidate !== c
+          || !this.playbackIntent || v.paused || v.seeking || v.error !== null
+          || this.seekResource && !this.seekResource.released) return;
+    }
+    // A crossed wide gap never borrows the switch allowance: it is only
+    // reported, and escalated if it persists, so the player can recover.
+    if (wide && !recovery && (crossed || !this.switchRecoveryCovers(curEnd!, nextStart!))) {
       if (!c.wideWarned) {
         c.wideWarned = true;
         this.logWarn(
@@ -3334,10 +3509,13 @@ export class MseMediaSource implements MediaSourceLike {
           + `t=${ct.toFixed(2)}s — MediaSource rebuild required`,
         );
         err.name = 'MediaGapUnrecoverableError';
+        this.recoverableGapError = err;
         try {
           this.onError?.(err);
         } catch {
           // Listener bugs must not corrupt adapter state.
+        } finally {
+          this.recoverableGapError = null;
         }
       }
       return;
@@ -3424,6 +3602,7 @@ export class MseMediaSource implements MediaSourceLike {
       `[MSE] gap-jump: skipped ${holeSec.toFixed(2)}s hole `
       + `${info.from.toFixed(2)}s -> ${info.to.toFixed(2)}s after ${info.waitedMs.toFixed(0)}ms`,
     );
+    return true;
   }
 
   /**
@@ -3506,14 +3685,6 @@ export class MseMediaSource implements MediaSourceLike {
       this.wedgeRung = 0;
       return;
     }
-    // Accepted work vetoes recovery while pending. Its completion alone does
-    // not repair a witnessed video hole: revalidate the actual buffers/ranges
-    // and continue sampling clock/quality progress through the pending period.
-    if (this.hasPendingNativeWork()) {
-      this.wedgeFrozenSinceMs = null;
-      this.handleWatchdogSeeked();
-      return;
-    }
     const hole = this.wedgeVideoHole;
     const wideHole = hole !== null && hole.start - hole.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC;
     if (wideHole && (v.ended || v.error !== null || this.appendQueueHold !== null)) {
@@ -3525,24 +3696,35 @@ export class MseMediaSource implements MediaSourceLike {
     // not paused, not seeking, decodable data ready, media ahead of the
     // playhead within its containing range. Anything else is a normal
     // pause/buffer/seek state owned by the existing paths.
-    let aheadSec = 0;
+    // A narrow hole just ahead (a later switch) caps the containing range. The
+    // media beyond it still counts outside the gap-jump edge window.
+    let aheadSec = 0, forwardSec = 0;
     try {
-      const buffered = v.buffered;
-      for (let i = 0; i < buffered.length; i++) {
-        if (ct >= buffered.start(i) && ct <= buffered.end(i)) {
-          aheadSec = buffered.end(i) - ct;
-          break;
-        }
-      }
+      aheadSec = MseMediaSource.aheadIn(v.buffered, ct, null, false);
+      forwardSec = MseMediaSource.aheadIn(v.buffered, ct, null, true);
     } catch { /* detached element */ }
     let postHole = false;
     if (this.gapJumpMs > 0 && hole !== null && quality !== null && ((v.readyState ?? 0) === 2 || wideHole)) {
       postHole = this.hasPostHoleCoverage(ct, wideHole);
-      if (!postHole) { this.clearVideoHoleEvidence(); this.handleWatchdogSeeked(); }
+      // The audio clock carries the playhead to the end of the buffered video
+      // before it freezes, so the first frozen sample can see under a second
+      // ahead. Thin forward coverage of a still-standing narrow hole only
+      // holds recovery off; a changed hole or a playhead outside its upper
+      // range retires the witness.
+      if (!postHole && !this.hasPendingNativeWork() && (wideHole || !this.isInsideWitnessedUpperRange(ct))) {
+        this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
+      }
     }
     if (v.paused || (v.seeking && !ownSeek) || !this.playbackIntent || (wideHole && (!postHole || (v.readyState ?? 0) < 2))
-        || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec <= 1) {
+        || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec < MseMediaSource.GAP_EDGE_WINDOW_SEC
+        || forwardSec <= 1) {
       this.wedgeFrozenSinceMs = null;
+      return;
+    }
+
+    // Pending work holds recovery only while the freeze remains eligible.
+    if (this.hasPendingNativeWork()) {
+      this.handleWatchdogSeeked();
       return;
     }
 
@@ -3650,16 +3832,43 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { this.wedgeCoveredPosition = null; }
   }
 
+  /** Seconds ahead of `ct` in the range containing it (optionally only one
+   * starting at `start`), continued across later holes no wider than the jump
+   * bound when `bridgeNarrow` is set. */
+  private static aheadIn(ranges: TimeRanges, ct: number, start: number | null, bridgeNarrow: boolean): number {
+    for (let i = 0; i < ranges.length; i++) {
+      if (ct < ranges.start(i) || ct > ranges.end(i) || (start !== null && ranges.start(i) !== start)) continue;
+      let end = ranges.end(i);
+      for (let j = i + 1; bridgeNarrow && j < ranges.length
+          && ranges.start(j) - end <= MseMediaSource.GAP_JUMP_MAX_HOLE_SEC; j++) end = ranges.end(j);
+      return end - ct;
+    }
+    return 0;
+  }
+
   private hasPostHoleCoverage(ct: number, requireAudio: boolean): boolean {
     const hole = this.wedgeVideoHole;
     if (hole === null || this.observeVideoHole(ct, ct) !== hole) return false;
     try {
       const ranges = this.videoBuffer?.buffered, audio = this.audioBuffer?.buffered;
-      return ranges !== undefined && Array.from({ length: ranges.length }, (_, i) => i).some(i =>
-        ranges.start(i) === hole.start && ranges.start(i) <= ct && ranges.end(i) - ct > 1)
+      // A narrow later hole may cap the upper range; media past it counts, but
+      // the playhead must stay outside the gap-jump edge window.
+      return ranges !== undefined
+        && MseMediaSource.aheadIn(ranges, ct, hole.start, false) >= MseMediaSource.GAP_EDGE_WINDOW_SEC
+        && MseMediaSource.aheadIn(ranges, ct, hole.start, true) > 1
         && ((!requireAudio && !audio) || (audio !== undefined && Array.from({ length: audio.length }, (_, i) => i)
           .some(i => audio.start(i) <= ct && audio.end(i) - ct > 1)));
     } catch { return false; /* Detached/evicted native media cannot justify a seek. */ }
+  }
+
+  private isInsideWitnessedUpperRange(ct: number): boolean {
+    const hole = this.wedgeVideoHole;
+    if (hole === null || this.observeVideoHole(ct, ct) !== hole) return false;
+    try {
+      const ranges = this.videoBuffer?.buffered;
+      return ranges !== undefined && Array.from({ length: ranges.length }, (_, i) => i).some(i =>
+        ranges.start(i) === hole.start && ranges.start(i) <= ct && ct <= ranges.end(i));
+    } catch { return false; }
   }
 
   private observeVideoHole(from: number, to: number): typeof this.wedgeVideoHole {
@@ -4073,6 +4282,11 @@ export class MseMediaSource implements MediaSourceLike {
     if (appended) {
       const pending =
         mediaType === 'video' ? this.pendingVideoRanges : this.pendingAudioRanges;
+      // CMSF-01 §3.3: one Object can contain multiple CMAF chunks. Measure
+      // the successful append's complete media duration, not arrival spacing.
+      const scale = this.timescale[mediaType];
+      this.startupObjectSec[mediaType] = scale && pending.length > 0
+        ? pending.reduce((sum, range) => sum + Number(range.endTime - range.startTime), 0) / scale : -1;
       const pendingTrack =
         mediaType === 'video' ? this.pendingVideoTrackIdentity : this.pendingAudioTrackIdentity;
       const pendingTrackName =
@@ -4087,9 +4301,11 @@ export class MseMediaSource implements MediaSourceLike {
           timeline = new TimelineIndex();
           timelines.set(pendingTrack, { trackName: pendingTrackName, index: timeline });
         }
+        const slack = this.contiguousSlack(mediaType);
         for (const r of pending) {
-          timeline.insert(r.startTime, r.endTime);
+          timeline.insert(r.startTime, r.endTime, slack);
         }
+        this.pruneRefused(timelines.get(pendingTrack)!);
         if (this.pendingGapSkip[mediaType] || this.lateAppendFloor[mediaType].has(pendingTrack)) {
           const end = timeline.extent?.end;
           if (end !== undefined) this.lateAppendFloor[mediaType].set(pendingTrack, end);
@@ -4144,6 +4360,7 @@ export class MseMediaSource implements MediaSourceLike {
       else this.appendOutcome(completing.token, 'unavailable', 'completion unproven');
     }
     if (this.destroyed || generation !== this.bufferGen) return;
+    if (appended && this.liveStartupCushionUs !== null) void this.requestStartup();
     // Behind-live cap: act on fresh data arrival (post-startup only).
     this.maybeChaseLiveEdge();
     this.drainQueue(mediaType);
@@ -4253,6 +4470,16 @@ export class MseMediaSource implements MediaSourceLike {
   // ─── Event handlers ────────────────────────────────────────────
 
   private handlePlaying = (): void => {
+    // Only the startup transaction may begin playback before startup succeeds.
+    if (!this.playTriggered && this.pendingElementPlays === 0) {
+      const recoveredMs = this.stallDetected && this.stallStartTime !== null
+        ? performance.now() - this.stallStartTime : null;
+      this.cancelStallEpisode();
+      this.video.pause();
+      void this.requestStartup();
+      if (recoveredMs !== null) this.onStallRecovered?.(recoveredMs);
+      return;
+    }
     if (this.seekResource && !this.seekResource.released) return;
     this.gapStallEpisode = false;                 // post-jump churn episode over
     // `playing` is the only genuine resumption signal: it is queued when ready

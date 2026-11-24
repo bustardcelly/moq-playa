@@ -199,6 +199,18 @@ export class PlaybackPipeline {
      */
     get pendingSampleByteCount(): number { return this.pendingSampleBytes; }
 
+    private _lateAudioHandler: ((offsetUs: number, object: MoqtObjectData) => boolean) | undefined;
+    /** For original-timeline, non-backfill audio, receives negative lateness
+     * past the output cushion, or zero for an on-time frame, and the borrowed wire Object.
+     * Do not mutate the Object. A thrown handler discards the frame as decoder policy.
+     * Return true after moving the shared clock to retry admission. Omission preserves dropping.
+     * Assignment replaces the handler; undefined removes it. Non-functions throw TypeError. */
+    get lateAudioHandler(): ((offsetUs: number, object: MoqtObjectData) => boolean) | undefined { return this._lateAudioHandler; }
+    set lateAudioHandler(handler: ((offsetUs: number, object: MoqtObjectData) => boolean) | undefined) {
+        if (handler !== undefined && typeof handler !== 'function') throw new TypeError('Expected a late audio handler');
+        this._lateAudioHandler = handler;
+    }
+
     private inputState: PipelineInputs | undefined;
     private playbackRevision = 0;
     /** Refused diagnostic associations, not rejected media or missing Objects. */
@@ -285,9 +297,6 @@ export class PlaybackPipeline {
         };
     }
 
-    /** Last emitted playback rate — dedup to avoid spamming commands. */
-    private _lastEmittedRate = 1.0;
-
     /**
  * Throttle flag — set by decoder feedback when queue depth is high.
  * While true, tick() evaluates gaps but does NOT drain the buffer.
@@ -368,7 +377,7 @@ export class PlaybackPipeline {
     /**
      * Install engine-owned audio timing without changing raw decoder timestamps.
      * A provider distinct from shared sync uses a mapped source domain, so it
-     * cannot control the shared reference, capture age, catch-up or drift
+     * cannot control the shared reference, capture age or drift
      * threshold. Undefined restores the original timeline. The engine owns mapping composition and
      * must drain or retire buffered inputs before replacing this provider.
      * Emitted commands retain their already captured absolute render times.
@@ -636,7 +645,7 @@ export class PlaybackPipeline {
         this.pruneDroppedObjects();
 
         // Interarrival jitter uses transit differences, so the timestamp epoch
-        // cancels out. Media time is suitable here, but not for latency/catch-up.
+        // cancels out. Media time is suitable here, but not for capture-age measurement.
         if (this.adaptiveTolerance && headers?.captureTimestamp !== undefined && delivery?.backfill !== true) {
             const nowMs = this.clock.now() / 1000; // µs → ms
             const captureUs = Number(headers.captureTimestamp);
@@ -1457,7 +1466,7 @@ export class PlaybackPipeline {
                     this.reportSample(inputs, input, batch, 'decoder reset'); return;
                 }
             }
-            const timing = this.mediaType === 'video'
+            let timing = this.mediaType === 'video'
                 ? videoTimingSource.computeVideoRenderTime(headers.captureTimestamp)
                 : originalTimeline && this.getAudioPlayoutDelayUs
                     ? this.sync.computeAudioRenderTime(headers.captureTimestamp, outputDelayUs)
@@ -1467,6 +1476,15 @@ export class PlaybackPipeline {
                 this.reportSample(inputs, input, batch, 'decoder reset'); return;
             }
 
+            let absorbed = false;
+            if (this.mediaType === 'audio' && originalTimeline && !backfill && timing) {
+                try { absorbed = this._lateAudioHandler?.(timing.shouldDrop ? timing.offsetUs + outputDelayUs : 0, obj) === true; }
+                catch { this.reportSample(inputs, input, batch, 'decoder policy'); return; }
+                if (revision !== this.playbackRevision || audioTimingSource !== this.audioTimingSource) {
+                    this.reportSample(inputs, input, batch, 'decoder reset'); return;
+                }
+            }
+            if (absorbed) timing = this.sync.computeAudioRenderTime(headers.captureTimestamp, outputDelayUs);
             if (timing === null) {
                 // An unavailable mapped schedule cannot become speculative "play now".
                 if (!originalTimeline) { this.reportSample(inputs, input, batch, 'decoder policy'); return; }
@@ -1486,8 +1504,12 @@ export class PlaybackPipeline {
                     // drops sufficiently late frames while keeping the newest.
                     renderTimeUs = originalTimeline ? this.clock.now() : timing.renderTimeUs;
                 } else {
-                    this.reportSample(inputs, input, batch, 'late frame');
-                    return; // Genuinely late and safe to discard — skip
+                    if (revision !== this.playbackRevision || audioTimingSource !== this.audioTimingSource) {
+                        this.reportSample(inputs, input, batch, 'decoder reset'); return;
+                    }
+                    const retimed = absorbed ? this.sync.computeAudioRenderTime(headers.captureTimestamp, outputDelayUs) : null;
+                    if (retimed === null || retimed.shouldDrop) { this.reportSample(inputs, input, batch, 'late frame'); return; }
+                    renderTimeUs = retimed.renderTimeUs;
                 }
             } else if (originalTimeline && timing.offsetUs > 5_000_000) {
                 renderTimeUs = this.clock.now();
@@ -1500,18 +1522,12 @@ export class PlaybackPipeline {
         }
 
         // 3b. Backfill primes decoding on the existing A/V timeline; it must
-        // not re-anchor that clock or change the live catch-up decision.
-        // Evaluate live catch-up from CaptureTimestamp
+        // not re-anchor that clock or change capture-age diagnostics.
+        // Observe CaptureTimestamp age
         // @see draft-ietf-moq-loc-01 §2.3.1.1 (latency measurement)
-        // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
         if (originalTimeline && !backfill && headers.captureTimestamp !== undefined) {
-            const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp, headers.timestampIsWallClock, this.mediaType);
-            if (catchUp !== null && catchUp.currentRate !== this._lastEmittedRate) {
-                this._lastEmittedRate = catchUp.currentRate;
-                this.onEvent({ type: 'catch_up_changed', state: catchUp });
-                if (revision !== this.playbackRevision) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }
-                this.onCommand({ type: 'set_playback_rate', rate: catchUp.currentRate });
-            }
+            // Capture-age diagnostics are independent of player rate policy.
+            this.sync.observeCaptureTimestamp(headers.captureTimestamp, headers.timestampIsWallClock, this.mediaType);
         }
 
         if (revision !== this.playbackRevision) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }

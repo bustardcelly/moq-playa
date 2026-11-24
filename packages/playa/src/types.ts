@@ -8,7 +8,7 @@
  * @module
  */
 
-import type { MoqtPlayerConfig, VideoPlaybackQualityStats } from '@openmoq/player';
+import type { MoqtPlayerConfig, VideoPlaybackQualityStats, VideoPresentationObservation } from '@openmoq/player';
 
 /** Player state machine values. */
 export type PlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error';
@@ -32,7 +32,7 @@ export interface PlayerOptions {
   /** SHA-256 cert hash for self-signed certs (local dev). */
   readonly certHash?: ArrayBuffer;
   /** MOQT draft version. Default: 16. */
-  readonly draftVersion?: 14 | 16 | 18 | 22;
+  readonly draftVersion?: 14 | 16 | 18 | 22 | 23;
   /** Auth tokens for CLIENT_SETUP. */
   readonly authTokens?: Uint8Array[];
   /** Issuer-supplied credentials for SETUP and subsequent requests. */
@@ -179,6 +179,8 @@ export interface PlayerStats {
   readonly captureTimestampAgeMs?: number | null;
   /** Native media-element-load counters, separate from legacy engine fields. */
   readonly videoPlaybackQuality?: Readonly<VideoPlaybackQualityStats> | null;
+  /** Explicit CMAF encode anchor of the presented frame; null without qualified evidence. */
+  readonly videoPresentationObservation?: VideoPresentationObservation | null;
   readonly stallCount: number;
   readonly timeToFirstFrameMs: number | null;
   readonly resolution: { readonly width: number; readonly height: number } | null;

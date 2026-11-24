@@ -1,3 +1,4 @@
+import { finishPublisherTerminal, type PublisherTerminalOptions } from './publisher-terminal.js';
 /**
  * InboundRequestStreamContext — owns one peer-initiated (inbound) request stream
  * (draft-18 §3.3). The peer opens the stream and sends a first request message
@@ -20,7 +21,7 @@
  * @module
  */
 
-import { MessageType, ProtocolViolationError, readVarint, type ControlCodec, type ControlMessage, type DecodedControlMessage } from '@openmoq/transport';
+import { isDraft22, MessageType, ProtocolViolationError, readVarint, type ControlCodec, type ControlMessage, type DecodedControlMessage } from '@openmoq/transport';
 import { ControlStreamFramer } from '../framer.js';
 import type { WebTransportBidirectionalStream } from '../types.js';
 
@@ -92,7 +93,7 @@ export class InboundRequestStreamContext {
     this.framer = new ControlStreamFramer(codec);
     // Draft-16 uses additional bidi streams only for namespace requests (§3.3).
     if (codec.version === 16) this.draft16Opener = { bytes: new Uint8Array(8), used: 0 };
-    if (codec.version === 22) {
+    if (isDraft22(codec.version)) {
       // STOP_SENDING can arrive after the peer has FINed its other direction.
       // The read loop is then over, so cancellation must also observe writes.
       void this.writer.closed.catch((err: unknown) => this.fail(err));
@@ -114,6 +115,7 @@ export class InboundRequestStreamContext {
    *  message is then a PROTOCOL_VIOLATION. */
   seal(): void {
     this.sealed = true;
+    this.rejectPendingUpdates(new Error('Publication ended'));
   }
 
   /** Send a LOCAL REQUEST_UPDATE; its REQUEST_OK / REQUEST_ERROR resolves the
@@ -143,6 +145,13 @@ export class InboundRequestStreamContext {
     await this.writer.write(this.codec.encode(message));
   }
 
+  async finishPublisher(message: ControlMessage, terminal: PublisherTerminalOptions): Promise<void> {
+    this.aborted = true;
+    this.seal();
+    this.rejectPendingUpdates(terminal.reason);
+    await finishPublisherTerminal(this.writer, this.reader, () => this.writeMessage(message), terminal);
+  }
+
   /** FIN our writable — e.g. after writing PUBLISH_DONE (§10.11). */
   async finish(): Promise<void> {
     this.finishing ??= this.writer.close().catch(() => { /* already closed/aborted */ });
@@ -165,7 +174,7 @@ export class InboundRequestStreamContext {
   }
 
   /** Abort the stream (rejected request / session teardown). Suppresses onFailure. */
-  async abort(): Promise<void> {
+  async abort(reason?: Error, reset?: PublisherTerminalOptions['resetSendStream'], sent?: () => void): Promise<void> {
     if (this.aborted) return;
     this.aborted = true;
     // Setting `aborted` makes the read loop return WITHOUT reaching its catch, so it
@@ -173,6 +182,12 @@ export class InboundRequestStreamContext {
     // awaiting an earlier update's response hangs forever (§11.4.1: the request
     // stream is gone, so no response can ever arrive).
     this.rejectPendingUpdates(new Error('inbound request stream aborted'));
+    if (reason) {
+      const results = await Promise.allSettled([Promise.resolve().then(() => this.reader.cancel(reason)),
+        Promise.resolve().then(() => reset ? reset(this.writer, reason, this.finishing ?? undefined) : this.writer.abort(reason)).then(sent)]);
+      for (const result of results) if (result.status === 'rejected') throw result.reason;
+      return;
+    }
     try { await this.reader.cancel(); } catch { /* already closed */ }
     try { await this.writer.abort(); } catch { /* already closed */ }
   }
@@ -232,7 +247,7 @@ export class InboundRequestStreamContext {
         }
         if (done) {
           for (const { message } of this.drainFrames()) await this.dispatch(message);
-          if (this.codec.version === 22 && this.framer.bufferedBytes !== 0) {
+          if (isDraft22(this.codec.version) && this.framer.bufferedBytes !== 0) {
             throw new ProtocolViolationError('inbound request stream FIN with a truncated control message');
           }
           if (this.pendingUpdates.length > 0) {

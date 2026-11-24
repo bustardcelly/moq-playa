@@ -79,7 +79,7 @@ Supported parameters:
 - `ns`
   - Broadcast namespace
 - `v`
-  - Optional MOQT draft version; `14`, `16`, or `18`
+  - Optional MOQT draft version: `14`, `16`, `18`, `22` or `23`
 - `hash`
   - Optional SHA-256 certificate hash in hex for self-signed TLS
 
@@ -89,7 +89,7 @@ Supported parameters:
 2. Open `/catalog/` in a supported browser.
 3. Enter the relay URL and target namespace.
 4. Enter the certificate hash if the relay is using a self-signed certificate.
-5. Select the draft version only if you need to force `14`, `16`, or `18`; otherwise leave it on auto.
+5. Select the draft version only if you need to force one; otherwise leave it on auto (draft 16).
 6. Click `Run Integration Test`.
 
 ## Expected Output
@@ -138,7 +138,7 @@ It does not validate:
 - CMAF segment assembly
 - end-to-end playback timing
 
-For those paths, use the other examples such as `/video/`, `/player/`, or `/simple/`.
+For those paths, use the other examples such as `/player/` or `/simple/`.
 
 ## Common Failures
 

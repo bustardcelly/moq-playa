@@ -1,5 +1,6 @@
+import type { PublicationOwner } from '../../shared/publication-state.js';
 import { describe, expect, it, vi } from 'vitest';
-import { RequestError18, SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } from '@openmoq/transport';
+import { SubscriptionStateMachine, RequestError18, SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } from '@openmoq/transport';
 import { MoqtConnection, type IncomingPublish } from '@openmoq/webtransport';
 import { DEMO_NAMESPACE, DEMO_TRACK, nsBytes, te } from './demo.js';
 import { Relay } from './relay.js';
@@ -14,6 +15,7 @@ interface SubscriberHarness {
   readonly openSubgroup: ReturnType<typeof vi.fn>;
   readonly sendObject: ReturnType<typeof vi.fn>;
   readonly closeSubgroup: ReturnType<typeof vi.fn>;
+  readonly resetSubgroup: ReturnType<typeof vi.fn>;
   readonly close: ReturnType<typeof vi.fn>;
   readonly activeStreams: () => number;
   readonly maxActiveStreams: () => number;
@@ -33,19 +35,36 @@ function subscriberHarness(streamLimit: number): SubscriberHarness {
   const closeSubgroup = vi.fn(async () => {
     activeStreams -= 1;
   });
+  const resetSubgroup = vi.fn(async () => { activeStreams -= 1; });
   const close = vi.fn(async () => undefined);
-  const acceptSubscribe = vi.fn(async () => undefined);
+  // The relay reads the SDK's own subscription state (identity, liveness and Location window) at every forwarding
+  // decision, so the fake connection keeps ONE real, accepted, unfiltered SubscriptionStateMachine per request id —
+  // exactly what the session would hold after acceptSubscribe — instead of a fresh anonymous stub per lookup.
+  const subscriptions = new Map<bigint, SubscriptionStateMachine>();
+  const incoming = (requestId: bigint) => {
+    let sub = subscriptions.get(requestId);
+    if (!sub) { sub = SubscriptionStateMachine.createAsPublisher(requestId); subscriptions.set(requestId, sub); }
+    return sub;
+  };
+  const acceptSubscribe = vi.fn(async (requestId: bigint, alias: bigint) => {
+    const sub = incoming(requestId);
+    if (sub.isPending) sub.sendSubscribeOk(alias);
+    sub.locationWindow = { start: { group: 0n, object: 0n } };
+  });
   const rejectSubscribe = vi.fn(async () => undefined);
   const conn = {
+    setLargestLocationProvider() {},
     draftVersion: 18,
     acceptSubscribe,
     rejectSubscribe,
     session: {
-      getIncomingSubscription: vi.fn(() => ({ remoteFilterType: 'AbsoluteStart' })),
+      draftVersion: 18, getOutgoingPublish: () => undefined,
+      getIncomingSubscription: vi.fn((requestId: bigint) => incoming(requestId)),
     },
     openSubgroup,
     sendObject,
     closeSubgroup,
+    resetSubgroup,
     close,
   } as unknown as MoqtConnection;
   return {
@@ -55,6 +74,7 @@ function subscriberHarness(streamLimit: number): SubscriberHarness {
     openSubgroup,
     sendObject,
     closeSubgroup,
+    resetSubgroup,
     close,
     activeStreams: () => activeStreams,
     maxActiveStreams: () => maxActiveStreams,
@@ -70,6 +90,11 @@ function incomingPublish(
     trackNamespace: nsBytes([...namespace]),
     trackName: te(DEMO_TRACK),
     trackAlias: alias,
+    // This payload-only mock stays live for its test; actual SDK retirement is
+    // exercised by receive-head.test.ts rather than a fabricated closed event.
+    initialTrackProperties: new Map(),
+    largestLocation: null,
+    closed: new Promise(() => {}),
     onObject: null,
     onSubgroupClosed: null,
   };
@@ -110,7 +135,12 @@ function subgroupHeader(alias: bigint, groupId: bigint, subgroupId = 0n): Subgro
 }
 
 async function acceptPublisher(relay: Relay, publish: IncomingPublish): Promise<void> {
-  const conn = { acceptSubscribe: vi.fn(async () => undefined) } as unknown as MoqtConnection;
+  const owner = { isPublishInitiated: true, isTerminated: false,
+    trackNamespace: publish.trackNamespace, trackName: publish.trackName, trackAlias: publish.trackAlias };
+  const conn = { transportInfo: null, observeObjectReception: () => () => {}, objectReceptionFor: () => undefined, observeObjectReceipts: () => () => {}, objectReceiptFor: () => undefined, acceptSubscribe: vi.fn(async () => undefined), session: {
+    state: 'established', getIncomingSubscription: (id: bigint) => id === publish.requestId ? owner : undefined,
+  } } as unknown as MoqtConnection;
+  relay.setupConnection(conn);
   await relay.handlePublish(conn, publish);
 }
 
@@ -224,7 +254,7 @@ describe('Relay subgroup lifecycle', () => {
     expect(sub.close).not.toHaveBeenCalled();
   });
 
-  it.each([18, 22] as const)('draft %s cancellation resets unfinished relay output instead of sending FIN', async (draft) => {
+  it.each([18, 22, 23] as const)('draft %s cancellation resets unfinished relay output instead of sending FIN', async (draft) => {
     const { a, b } = createLoopback();
     const client = new MoqtConnection(draft);
     const server = new MoqtConnection(draft, { role: 'server' });
@@ -234,6 +264,7 @@ describe('Relay subgroup lifecycle', () => {
     server.onSubscribe = (requestId, namespace, name) => { void relay.handleSubscribe(server, requestId, namespace, name); };
     server.onSubscribeClosed = (requestId) => relay.removeSubscription(server, requestId);
     try {
+      relay.setupConnection(server);
       await Promise.all([client.connect(a), server.connect(b)]);
       const subscription = await client.subscribeTrack(nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
       const publish = incomingPublish();
@@ -251,7 +282,7 @@ describe('Relay subgroup lifecycle', () => {
     } finally { await client.close(); await server.close(); }
   });
 
-  it('preserves the incoming END_OF_GROUP header through live forwarding and cache replay', async () => {
+  it('preserves the incoming END_OF_GROUP header through live forwarding, for an early and a later subscriber', async () => {
     const relay = new Relay();
     const live = subscriberHarness(4);
     await relay.handleSubscribe(live.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
@@ -265,6 +296,11 @@ describe('Relay subgroup lifecycle', () => {
     await vi.waitFor(() => expect(live.closeSubgroup).toHaveBeenCalledOnce());
     const late = subscriberHarness(4);
     await relay.handleSubscribe(late.conn, 3n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    await flush();
+    expect(late.openSubgroup, 'the completed group 1 is history for FETCH, not replayed').not.toHaveBeenCalled();
+    publish.onObject?.({ ...object(publish.trackAlias, 2n, 5n), isFirstObjectInSubgroup: true,
+      subgroupContainsEndOfGroup: true });
+    publish.onSubgroupClosed?.({ ...subgroupHeader(publish.trackAlias, 2n), isEndOfGroup: true });
     await vi.waitFor(() => expect(late.closeSubgroup).toHaveBeenCalledOnce());
     expect(late.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ endOfGroup: true });
   });
@@ -276,12 +312,17 @@ describe('Relay subgroup lifecycle', () => {
     const publications = new Map<bigint, IncomingPublish>();
     const streams = new Map<bigint, { alias: bigint; group: bigint; subgroup: bigint; first: boolean }>();
     let nextRequest = 0n;
+    const owners = new Map<bigint, PublicationOwner>();
     const origin = {
+      setLargestLocationProvider() {},
+      session: { draftVersion: 18, getOutgoingPublish: (id: bigint) => owners.get(id), getIncomingSubscription: () => undefined },
       onMessage: undefined as ((m: { type: string; requestId: bigint }) => void) | undefined,
       async publish(namespace: Uint8Array[], name: Uint8Array, alias: bigint) {
         const requestId = nextRequest++;
+        owners.set(requestId, { isTerminated: false, trackNamespace: namespace, trackName: name, trackAlias: alias });
         const p: IncomingPublish = { requestId, trackNamespace: namespace, trackName: name,
-          trackAlias: alias, onObject: null, onSubgroupClosed: null };
+          trackAlias: alias, initialTrackProperties: new Map(), largestLocation: null, closed: new Promise(() => {}),
+          onObject: null, onSubgroupClosed: null };
         publications.set(alias, p);
         await acceptPublisher(relay, p);
         setTimeout(() => origin.onMessage?.({ type: 'REQUEST_OK', requestId }), 0);
@@ -318,11 +359,21 @@ describe('Relay subgroup lifecycle', () => {
     expect(live.sendObject.mock.calls.map((c) => c[1])).toEqual([0n, 1n, 2n]);
     const late = subscriberHarness(4);
     await relay.handleSubscribe(late.conn, 3n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    await flush();
+    expect(late.sendObject, 'loop 0 is history for FETCH, not replayed').not.toHaveBeenCalled();
+    // This mock retires the first finite publisher before a new fixture
+    // invocation re-establishes the same aliases. Its old payload is not replayed.
+    owners.clear();
+    // The next loop is published after the later subscriber joined.
+    await publishFixture(origin as unknown as MoqtConnection, {
+      manifest: { namespace: DEMO_NAMESPACE, renderGroup: 1, chunkDurationMs: 500, tracks: [meta] },
+      tracks: [{ meta, initData: videoInit(), chunks: [1, 2, 3].map((v) => new Uint8Array([v])) }],
+    }, { catalogFormat: 'cmsf-01', startLoop: 1 });
     await vi.waitFor(() => expect(late.sendObject).toHaveBeenCalledTimes(3));
-    expect(late.openSubgroup.mock.calls.map((c) => c[3])).toEqual(live.openSubgroup.mock.calls.map((c) => c[3]));
+    expect(late.openSubgroup.mock.calls.map((c) => c[3])).toEqual(live.openSubgroup.mock.calls.slice(0, 3).map((c) => c[3]));
   });
 
-  it('preserves nonzero FIRST_OBJECT evidence during live forwarding and cache replay', async () => {
+  it('preserves nonzero FIRST_OBJECT evidence during live forwarding, for an early and a later subscriber', async () => {
     const relay = new Relay();
     const live = subscriberHarness(2);
     await relay.handleSubscribe(live.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
@@ -333,6 +384,9 @@ describe('Relay subgroup lifecycle', () => {
     expect(live.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ firstObject: true });
     const late = subscriberHarness(2);
     await relay.handleSubscribe(late.conn, 3n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    await flush();
+    expect(late.sendObject, 'the earlier Object is history for FETCH, not replayed').not.toHaveBeenCalled();
+    publish.onObject?.({ ...object(publish.trackAlias, 1n, 7n), subgroupId: 2n, isFirstObjectInSubgroup: true });
     await vi.waitFor(() => expect(late.sendObject).toHaveBeenCalledOnce());
     expect(late.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ firstObject: true });
   });
@@ -534,13 +588,13 @@ describe('Relay subgroup lifecycle', () => {
     expect(subscriber.maxActiveStreams()).toBe(4);
   });
 
-  it('closes a completed cached subgroup after replay to a late subscriber', async () => {
+  it('closes a completed subgroup that arrives after a later subscriber joined, keeping its properties; a completed earlier one is not replayed', async () => {
     const relay = new Relay();
     const publish = incomingPublish();
     await acceptPublisher(relay, publish);
     const locProperties = new Uint8Array([0x0b, 0x03, 0x01]);
-    publish.onObject?.(object(publish.trackAlias, 8n, 0n, locProperties));
-    publish.onSubgroupClosed?.(subgroupHeader(publish.trackAlias, 8n));
+    publish.onObject?.(object(publish.trackAlias, 7n, 0n, locProperties));
+    publish.onSubgroupClosed?.(subgroupHeader(publish.trackAlias, 7n));
 
     const subscriber = subscriberHarness(1);
     await relay.handleSubscribe(
@@ -549,6 +603,10 @@ describe('Relay subgroup lifecycle', () => {
       nsBytes(DEMO_NAMESPACE),
       te(DEMO_TRACK),
     );
+    await flush();
+    expect(subscriber.openSubgroup, 'the completed group 7 is history for FETCH, not replayed').not.toHaveBeenCalled();
+    publish.onObject?.(object(publish.trackAlias, 8n, 0n, locProperties));
+    publish.onSubgroupClosed?.(subgroupHeader(publish.trackAlias, 8n));
 
     await vi.waitFor(() => {
       expect(subscriber.sendObject).toHaveBeenCalledOnce();
@@ -576,6 +634,9 @@ describe('Relay subgroup lifecycle', () => {
         expect.stringMatching(/subgroup 4\/0 opened without properties/i),
       ));
       expect(subscriber.sendObject).toHaveBeenCalledOnce();
+      expect(subscriber.resetSubgroup).toHaveBeenCalledOnce();
+      expect(subscriber.closeSubgroup).not.toHaveBeenCalled();
+      expect(subscriber.activeStreams()).toBe(0);
     } finally {
       error.mockRestore();
     }
@@ -589,7 +650,11 @@ describe('Relay subgroup lifecycle', () => {
     publish.onObject?.(object(publish.trackAlias, 5n, 0n, locProperties));
 
     const sendFetchObject = vi.fn(async (_streamId: bigint, _fields: unknown) => undefined);
+    const fetchOwner = { isCompleted: false };
     const conn = {
+      setLargestLocationProvider() {}, setFetchLargestLocationProvider() {},
+      session: { draftVersion: 18, getIncomingFetch: (id: bigint) => id === 4n ? fetchOwner : undefined,
+        getIncomingSubscription: () => undefined, getOutgoingPublish: () => undefined },
       draftVersion: 18,
       acceptFetch: vi.fn(async () => undefined),
       openFetchStream: vi.fn(async () => 77n),
